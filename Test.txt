@@ -1,0 +1,1727 @@
+/***************************************************************************************************
+ Class Name : AccountTriggerGenericHelper
+ Description : This class will handle the logic for all the account trigger whcih are common across projects
+ -----------------------------------------------------------------------------------------------------
+ Date             Author            Version            Comments
+ 2/12/2016        Deepika M         1.0                Initial Development
+ *****************************************************************************************************/
+public class AccountTriggerGenericHelper{
+    //logged in user data
+    public static User currentUser = TriggerUtility.getUserRecord();
+    //Group members of Group along with current user is associated
+    public static List<GroupMember> GrpMemList = ContactTriggerUtility.getUsersGrpMemList(currentUser);
+    public static Map<String, List<GroupMember>> userGroupMemberMap = new Map<String, List<GroupMember>>();
+    //added
+    public static String usrrole = currentuser.userrole.name;
+    public static String usrteamrole = currentuser.tfcrmTeamRole__c;//Added for GTT-4077
+    public static String groupType = Schema.SObjectType.Group.getKeyPrefix();
+    public static List<GroupMember> fxallEntitlementLst = AccountTriggerUtility.getGRMLst();
+    public static List<Id> indirectIDLst = new List<Id>();
+    public static boolean fxallEntitlementFlag = false;
+    public static Boolean isAccountUpdate;
+    public static boolean accountHierarchyCheckRecusrive = false;
+    public static Set<id> UltimateParentList = new Set<id>();
+    public static List<Ultimate_Parent_Flow__c> upBoomiFlow = new List<Ultimate_Parent_Flow__c>();
+    public static List<Ultimate_Parent_Flow__c> accountsInFlow = new List<Ultimate_Parent_Flow__c>();
+    public static Set<Id> datamigruserId = new Set<Id>();//by Sibatri for 101-4105
+    public static List<IntegrationFields__mdt> listMD = new List<IntegrationFields__mdt>(); //by Sibatri for 101-4105
+    public static Boolean recursivecheck = false; //sfcf-1788 SOQL-101 error
+    public static Id contextUserId = UserInfo.getUserId();
+    public static User contextUser;
+
+    /***********************************************************************************
+     Method Name : --
+     Purpose     : Maintaining a map of user group
+     Return type : -
+     Call from   : Common code for Before insert and before update
+     ************************************************************************************/
+    static{
+        //create empty map for all groups
+        userGroupMemberMap.put('Service_Entitled_Users', new List<GroupMember>());
+
+        //MTI-3204
+        userGroupMemberMap.put(label.FXALLEntitledGroupName, new List<GroupMember>());
+
+        //seperating all the group members to their respective groupMember List
+        if (!GrpMemList.isEmpty() && GrpMemList != null){
+            for (GroupMember grpMember : GrpMemList){
+                if (grpMember.Group.DeveloperName == 'Service_Entitled_Users'){
+                    //Service entitled user group
+                    userGroupMemberMap.get('Service_Entitled_Users').add(grpMember);
+                }
+                //adding grou
+
+                //MTI-3204
+                if (grpMember.Group.DeveloperName == label.FXALLEntitledGroupName){
+                    //Service entitled user group
+                    userGroupMemberMap.get(label.FXALLEntitledGroupName).add(grpMember);
+                }
+            }
+            //end of for
+        }
+        //end of if
+
+        if (fxallEntitlementLst != null && fxallEntitlementLst.size() > 0){
+            for (GroupMember gr : fxallEntitlementLst){
+                if (String.valueOf(gr.UserOrGroupId).startsWith(groupType)){
+                    indirectIDLst.add(gr.UserOrGroupId);
+                }
+            }
+            //end of for loop
+
+            if (indirectIDLst != null && indirectIDLst.size() > 0 && !Test.isRunningTest()){
+                List<Group> indirectgroup = AccountTriggerUtility.getGropuLst(indirectIDLst);
+                if (indirectgroup != null && indirectgroup.size() > 0){
+                    for (Group grRec : indirectgroup){
+                        if (usrrole != null && usrrole.containsOnly(grRec.related.name)){
+                            fxallEntitlementFlag = true;
+                        }
+                    }
+                }
+            }
+        }
+        //end of if
+    }
+    //end static
+    /*********************************************************************************************
+     Common method to execute the before update functionalities
+     ----------------------------------------------------------------------------------------------
+     Functionalities Implemented:
+     1. Restricting account name update if initiated by 'Automated Process' user
+     2. Update Account_Class fields on change of trAccountClass__c
+     3. Update Account Flag to true if number of child Opportunity for each Account is one else false on other scenarios(i.e zero/more than one)
+     4. To update the owning pool field in Account if the owner has changed or the owning pool has changed
+     5. Update the Account team history object when the account owner has changed
+     6. To update the Last Modified date if there are any changes in the field associated to the Account record
+     7. To validate Shippping country and Shipping city
+     8. To check if the user is a Valid Account Manager or not
+     9. To Validate Address and checks if address is validated on updated account
+     10. MTI-2014 to check if customer is entitle to update the account Service entitlement field
+     11. For CM migration TCID,CAID,Office,CompanyId Generation. By shravan
+     ************************************************************************************************/
+    public static void genericBeforeUpdate(Map<Id, SObject> newItems, Map<Id, SObject> oldItems){
+        System.debug('Entered generic before update');
+        //Initialise variables
+        List<Id> ownerIds = new List<Id>();
+        Map<Id, Id> directPoolMap = new Map<Id, Id>();
+        Map<String, Boolean> mapFieldStatus = new Map<String, Boolean>();
+        Map<String, Boolean> mapFieldStatusOfUser = new Map<String, Boolean>();
+        List<Account> lstAccIdStateValidation = new List<Account>();
+
+        List<Account> newAccItems = (List<Account>)newItems.values();
+        List<Account> oldAccItems = (List<Account>)oldItems.values();
+        List<Id> lstOFAccountOwnerIDs = new List<Id>();
+        List<Account> lstOfAccount = new List<Account>();
+        Map<Id, Id> mapOfAccountToOwnerId = new Map<Id, Id>();
+        isAccountUpdate = true;
+        boolean isTcidGenerated = false; // added for CMMS-2 
+        boolean isCaidGenerated = false; // added  for CMMS-2
+        boolean isCmAddGenerated = false; // added  for CMMS-2
+        //getopptyteaminfo variables
+        Set<Id> setAccountWithOwnerIDChanged = new Set<Id>();
+        Map<Id, Id> mapAccountId = new Map<Id, Id>();
+        List<String> accountOldOwnerNewOwnerList = new List<String>();
+        List<Account> accountCAAList = new List<Account>();
+        List<Id> lstOFAccountIDs = new List<Id>();
+        Set<Id> changedAcc = new Set<Id>();
+        List<tocSubscriber__c> billingAccUpdateList = new List<tocSubscriber__c>();
+        list<Account> ChangedCountryCodeList = new list<Account>();
+        Set<Id> SetofAccountstoUpdate = new Set<Id>();//List to get accounts which are updating countrycodes
+        //To validate user whether valid account manager or not
+        Set<String> trConstantset = new Set<String>();
+
+        //Production Fix to limit messages to external System - START
+        // List<IntegrationFields__mdt> listMD =
+
+        if (listMD == null || listMD.size() == 0)
+            //Start- Code Optimization-prod issue - Nitish
+            //listMD=[Select FieldsList__c from IntegrationFields__mdt where DeveloperName = 'Account' limit 1];
+                {
+                IntegrationFields__mdt mdIntField1 = IntegrationFields__mdt.getInstance('Account1');
+            IntegrationFields__mdt mdIntField2 = IntegrationFields__mdt.getInstance('Account2');
+            IntegrationFields__mdt mdIntField3 = IntegrationFields__mdt.getInstance('Account3');
+            IntegrationFields__mdt mdIntField4 = IntegrationFields__mdt.getInstance('Account4');
+            IntegrationFields__mdt mdIntField5 = IntegrationFields__mdt.getInstance('Account5');
+            IntegrationFields__mdt mdIntField6 = IntegrationFields__mdt.getInstance('Account6');
+
+            if (mdIntField1 != null && mdIntField2 != null && mdIntField3 != null && mdIntField4 != null && mdIntField5 != null && mdIntField6 != null ){
+                String fieldListVal = mdIntField1.FieldsList__c + mdIntField2.FieldsList__c + mdIntField3.FieldsList__c + mdIntField4.FieldsList__c + mdIntField5.FieldsList__c + mdIntField6.FieldsList__c ;
+                IntegrationFields__mdt mdFinalIntField = new IntegrationFields__mdt();
+                mdFinalIntField.FieldsList__c = fieldListVal;
+                listMD.add(mdFinalIntField);
+            }
+        }
+        //End- Code Optimization-prod issue - Nitish
+
+        Map<String, Boolean> mapofIntegFields = new Map<String, Boolean>();
+        List<String> listOfIntegFields = new List<String>();
+        if (listMD != null && !listMD.isEmpty()){
+            if (listMD[0].FieldsList__c != null && listMD[0].FieldsList__c != ''){
+                listOfIntegFields.addall(listMD[0].FieldsList__c.split(','));
+            }
+        }
+        //Production Fix to limit messages to external System - END
+		//code change shivani -- to trigger update for commercial model 
+		listOfIntegFields.addall(('Commercial_Model__c').split(','));
+        //Initialise UserInf variable
+        User userInf = TriggerUtility.getUserRecord();
+        Boolean userFlag = userInf.Edit_Active_Account_Flag__c;
+        Boolean checkOppIsExecuted = (!triggerHandlingOFOpportunity.isExecuted);
+        boolean isCountryAvailable = true;
+        List<Id> lstOwnerIds = new List<Id>();
+
+        Map<Id, Id> mapqueuable = new Map<Id, Id>();
+
+        //Call PAC method to uldate commercial model
+        //AccountTriggerHelper.PACupdateonaccount(newItems.values());
+        Hierarchy_Trigger__c settings = Hierarchy_Trigger__c.getOrgDefaults();
+        Map<String, trConstants__c> mapOfConstants = AccountTriggerUtility.getTrConstants();
+        //To obtain the List of values for profile name 'Profile_Excluded_Transfer'
+        for (trConstants__c objConstant : mapOfConstants.values()){
+            if (objConstant.name.contains('Profile_Excluded_Transfer')){
+                trConstantset.add(objConstant.Value__c);
+            }
+        }
+
+        //Obtain the values of fields that have changed
+        List<String> lstFieldToCheckStatus = new List<String>{ 'Name', 'ShippingCity', 'ShippingCountry', 'OwnerId', 'Owning_Pool__c', 'trAccountClass__c', 'Credit_Check_Status__c', 'TDO_Status__c', 'ShippingStreet', 'ShippingPostalCode', 'ShippingState', 'Ultimate_Parent_Account__c', 'Genesis_Flag__c', 'GRC_Restrict_Migration_Flag__c', 'Service_Entitlement__c', 'Exit_Rate_USD__c' };
+        //Added as part of TSV-1241 starts
+        //Added as part of TSV-1241 starts
+        List<Partner_Accounts__c> partneraccounts = new List<Partner_Accounts__c>();
+        Set<Id> delPartnerSet = new Set<Id>();
+        List<Id> Partnervaluetodeleted = new List<Id>();
+        Map<Id, Id> PartnerOppIdMap = new Map<Id, Id>();
+        Set<string> Partnervalue = new SET<String>();
+        boolean partnerValues = false;
+        SET<Id> acctIds = new SET<Id>(); //Added by Manasa
+
+        Partnervalue.addAll(Label.partner_role.split(','));
+        MAP<Id, Partner_Accounts__c> Accountdetails = new MAP<Id, Partner_Accounts__c>();
+        System.debug('PartnervaluePartnervalue' + Partnervalue);
+
+        //FRO-3507 RMA Rippling from parent to children
+        //FRO-3507 RMA Rippling from parent to children
+        System.debug(LoggingLevel.Info, 'RMA Rippling Condition');
+       //
+
+        For (Account rmaChange : newAccItems){
+            Account oldAccountRma = (Account) oldItems.get(rmaChange.ID);
+            //QPA-6214
+            if (rmaChange.ParentID != oldAccountRma.ParentID){
+                rmaChange.CLM_Reparenting_Status__c = null;
+            }
+            if (rmaChange.tfcmCountryCode__c != oldAccountRma.tfcmCountryCode__c){
+                //QCCF-132
+                SetofAccountstoUpdate.add(rmaChange.Id);
+            }
+
+            if (rmaChange.Partner_Role__c != null || oldAccountRma.Partner_Role__c != null)
+                acctIds.add(rmaChange.Id);
+            System.debug(LoggingLevel.Info, 'RMA Rippling Condition for loop ' + oldAccountRma);
+            System.debug(LoggingLevel.Info, 'RMA Rippling Condition RMA check ' + settings.queueExecuted__c);
+            System.debug(LoggingLevel.Info, 'RMA Rippling Condition RMA check ' + accountHierarchyCheckRecusrive);
+            System.debug(LoggingLevel.Info, 'rmaChange.tocAgreementType__c ' + rmaChange.tocAgreementType__c);
+            System.debug(LoggingLevel.Info, 'oldAccountRma.tocAgreementType__c ' + oldAccountRma.tocAgreementType__c);
+
+
+            if ((!settings.queueExecuted__c) && (rmaChange.tocAgreementType__c == label.RMA_Form_Name && (oldAccountRma.tocAgreementType__c == NULL || oldAccountRma.tocAgreementType__c != label.RMA_Form_Name)) && accountHierarchyCheckRecusrive == false){
+                System.debug(LoggingLevel.Info, 'RMA Rippling Condition RMA check ' + rmaChange.Ultimate_Parent_Account__c);
+
+
+                mapqueuable.put(rmaChange.Id, rmaChange.ParentId);
+                if (rmaChange.Ultimate_Parent_Account__c == null)
+                    UltimateParentList.add(rmaChange.Id);
+                else
+                    UltimateParentList.add(rmaChange.Ultimate_Parent_Account__c);
+            }
+            System.debug(LoggingLevel.Info, 'UltimateParentList ' + UltimateParentList);
+        }
+
+        if (mapqueuable.size() > 0 && !Test.isRunningTest()){
+
+            accountsInFlow = [select Name, Status_of_Job__c
+                              from Ultimate_Parent_Flow__c
+                              where Name = :UltimateParentList AND Status_of_Job__c = 'RMA'];
+            System.debug(LoggingLevel.Info, 'accountsInFlow ' + accountsInFlow);
+            if (accountsInFlow.size() <= 0){
+
+                For (id rmaChange : UltimateParentList){
+                    Ultimate_Parent_Flow__c UpFlow = new Ultimate_Parent_Flow__c();
+                    UpFlow.Name = rmaChange;
+                    UpFlow.Status_of_Job__c = 'RMA';
+                    upBoomiFlow.add(UpFlow);
+                }
+                if (upBoomiFlow.size() > 0){
+                    Insert upBoomiFlow;
+                    System.debug(LoggingLevel.Info, 'upBoomiFlow' + upBoomiFlow);
+
+                }
+                System.debug(LoggingLevel.Info, 'upBoomiFlow ' + upBoomiFlow);
+                //insert here into Ultimate_Parent_Flow__c
+                Accounthierarchyqueueable qe = new Accounthierarchyqueueable(mapqueuable);
+                System.enqueueJob(qe);
+                //added by sandeep FRO-1654
+                accountHierarchyCheckRecusrive = true;
+            }
+        }
+        //Iterate through each record of the account
+        if (!acctIds.IsEmpty() && acctIds.size() > 0){
+            List<Partner_Accounts__c> Account = new List<Partner_Accounts__c>();
+            Account = [Select Id, AccountId__c
+                       from Partner_Accounts__c
+                       where AccountId__c IN:acctIds];//Ends
+            for (Partner_Accounts__c p1 : Account){
+                Accountdetails.put(p1.AccountId__c, p1);
+            }
+        }
+        Set<String> NorthLatemcodes = new Set<String>{ 'BLZ', 'COL', 'MEX', 'PAN', 'PER', 'VEN', 'CRI', 'DOM', 'ECU', 'SLV', 'GTM', 'HND', 'NIC' };
+        Set<String> SouthLatemcodes = new Set<String>{ 'ARG', 'BOL', 'CHL', 'URY', 'PRY', 'BRA' };
+        Set<String> Countrycodes = new Set<String>{ 'AIA', 'ATG', 'ARG', 'ARG', 'ARG', 'ABW', 'BHS', 'BRB', 'BLZ', 'BMU', 'BOL', 'BRA', 'BRA', 'CAN', 'CYM', 'CHL', 'COL', 'COL', 'COL', 'CRI', 'DMA', 'DOM', 'ECU', 'SLV', 'GUF', 'GRD', 'GLP', 'GTM', 'GUY', 'HTI', 'HND', 'JAM', 'MTQ', 'MEX', 'MSR', 'ANT', 'NIC', 'PAN', 'PRY', 'PER', 'PER', 'PER', 'PRI', 'KNA', 'LCA', 'SPM', 'VCT', 'SUR', 'TTO', 'TCA', 'USA', 'UMI', 'URY', 'VEN', 'VGB', 'VIR' };
+        if (SetofAccountstoUpdate != null && (ChangedCountryCodeList.isEmpty() && recursivecheck != true)){
+            ChangedCountryCodeList = [SELECT Id, Refinitiv_SubMarket__c, tfcmCountryCode__c, AccountOwner__c, AccountOwner__r.UserRole.Name
+                                      from Account
+                                      where Id = :SetofAccountstoUpdate];//QCCF-132
+            recursivecheck = true;
+        }
+        Map<Id, Account> MapOfAccsToUpdate = new Map<Id, Account>();
+        if (ChangedCountryCodeList != null){
+            For (Account acc : ChangedCountryCodeList){
+                MapOfAccsToUpdate.put(acc.Id, acc);
+            }
+        }
+        for (Account currentAccount : newAccItems){
+            if (MapOfAccsToUpdate.containskey(currentAccount.Id)){
+                //QCCF-132
+                System.debug('Contains');
+                String RoleofAccOwner = MapOfAccsToUpdate.get(currentAccount.Id).AccountOwner__r.UserRole.Name;
+                System.debug('Role Name:' + RoleofAccOwner);
+                if ((NorthLatemcodes.contains(currentAccount.tfcmCountryCode__c)) && !NorthLatemcodes.contains(MapOfAccsToUpdate.get(currentAccount.Id).tfcmCountryCode__c)){
+                    //check old value Refinitiv_SubMarket__c
+                    //if(MapOfAccsToUpdate.get(currentAccount.Id).Refinitiv_SubMarket__c! = currentAccount.Refinitiv_SubMarket__c)
+                    currentAccount.Refinitiv_SubMarket__c = 'North Latam';
+                } else if ((SouthLatemcodes.contains(currentAccount.tfcmCountryCode__c)) && !SouthLatemcodes.contains(MapOfAccsToUpdate.get(currentAccount.Id).tfcmCountryCode__c)){
+                    currentAccount.Refinitiv_SubMarket__c = 'South Latam';
+                } else if ((Countrycodes.contains(currentAccount.tfcmCountryCode__c)) && (RoleofAccOwner != null)){
+                    System.debug('Role Name:' + RoleofAccOwner);
+                    if ((RoleofAccOwner.containsIgnoreCase('AMERS')) && (RoleofAccOwner.containsIgnoreCase('CC')) && (RoleofAccOwner.containsIgnoreCase('Connect Plus'))){
+                        System.debug('Role Name:' + RoleofAccOwner);
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - Connect Plus';   // criteria 3
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('new biz')) && (RoleofAccOwner.containsIgnoreCase('central'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - New Biz Central'; // criteria 4
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('new biz')) && (RoleofAccOwner.containsIgnoreCase('corp'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - New Biz Corp East';   // criteria 5
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('new biz')) & (RoleofAccOwner.containsIgnoreCase('Fin'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - New Biz Fin East';   // criteria 6
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('new biz')) & (RoleofAccOwner.containsIgnoreCase('west'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - New Biz West';   // criteria 7
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('new biz')) && (RoleofAccOwner.containsIgnoreCase('central west'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - AM Central West';       // criteria 8
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('new biz')) && (RoleofAccOwner.containsIgnoreCase('east'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC - AM East';           // criteria 9  -end
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'RCC Other';    // criteria 10
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('cc')) && (RoleofAccOwner.containsIgnoreCase('asset'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'East - Asset & Wealth Mgm';  // criteria 11
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('east')) && (RoleofAccOwner.containsIgnoreCase('capital'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'East - Capital Markets & Corp';        // criteria 12
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('east')) && (RoleofAccOwner.containsIgnoreCase('ksa'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'East - KSA';             // criteria 13
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('east'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'East Other';            // criteria 14
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('central')) && (!RoleofAccOwner.containsIgnoreCase('west'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'Central';                    // criteria 15
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('west')) && (!RoleofAccOwner.containsIgnoreCase('central'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'West';                       // criteria 16
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('west')) || (RoleofAccOwner.containsIgnoreCase('central'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'Central and West Other';         // criteria 17
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('latam')) || (RoleofAccOwner.containsIgnoreCase('latam br_ls'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'Latam South & Brazil';              // criteria 18
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('latam')) || (RoleofAccOwner.containsIgnoreCase('latam ln'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'Latam North';                       // criteria 19
+                    } else if ((RoleofAccOwner.containsIgnoreCase('Amers')) && (RoleofAccOwner.containsIgnoreCase('latam'))){
+                        currentAccount.Refinitiv_SubMarket__c = 'Latam Other';                    // criteria 20
+                    }
+                } else{
+                    currentAccount.Refinitiv_SubMarket__c = currentAccount.sub_region__c;
+                }
+            }
+            //QCCF-132 ends
+
+            Account oldAccount = (Account) oldItems.get(currentAccount.ID);
+
+            //added GTT-4450
+            SET<String> oldPropList = new SET<String>();
+            SET<String> currentPropList = new SET<String>();
+            if (oldAccount.Account_Proposition__c != null && oldAccount.Account_Proposition__c != '')
+                oldPropList.addAll(oldAccount.Account_Proposition__c.split(';'));
+            if (currentAccount.Account_Proposition__c != null && currentAccount.Account_Proposition__c != '')
+                currentPropList.addAll(currentAccount.Account_Proposition__c.split(';'));
+            if (currentUser.ProfileId != Label.SystemAdmin && ((currentPropList.size() > 0 && oldPropList.size() > 0 && !currentPropList.containsAll(oldPropList)) || (currentAccount.Account_Proposition__c == null && oldAccount.Account_Proposition__c != null))){
+                currentAccount.addError(label.Only_Admin_can_remove_Account_Proposition_values);
+            }
+            //added GTT-4450
+
+            //Added as part of TSV-1241
+            if (currentAccount.Partner_Role__c != null || oldAccount.Partner_Role__c != null){
+                SET<string> setofpartnervalues = new SET<string>();
+                if (currentAccount.Partner_Role__c != null){
+                    setofpartnervalues.AddAll(currentAccount.Partner_Role__c.split(';'));
+                    for (String partner : Partnervalue){
+                        if (setofpartnervalues.contains(partner)){
+                            partnerValues = true;
+                        }
+                    }
+                }
+
+                if (currentAccount.Partner_Role__c != null && oldAccount.Partner_Role__c != currentAccount.Partner_Role__c && partnerValues == True){
+                    System.debug('iiiiif');
+                    if (Accountdetails.IsEmpty() || Accountdetails.size() == 0){
+                        Partner_Accounts__c partneracount = new Partner_Accounts__c();
+                        partneracount.AccountId__c = currentAccount.id;
+                        if (currentAccount.Name.length() > 80)
+                            partneracount.Name = currentAccount.Name.substring(0, 80);
+                        else
+                            partneracount.Name = currentAccount.Name;
+                        partneracount.AccountName__c = currentAccount.Name;
+                        partneraccounts.add(partneracount);
+                    }
+                }
+
+            }
+            //TSV-1241 ends
+            //Add owner Id to List
+            lstOwnerIds.add(currentAccount.OwnerId);
+
+            //Obtain and assign the old record
+
+            //FRO-1519 AccountMaster changes
+              if (currentAccount.ParentID != oldAccount.ParentId && accountHierarchyCheckRecusrive == false){
+            system.debug('parent ID' + currentAccount.ParentID); //smita
+                 system.debug('LEGAL ENTITY' + currentAccount.Legal_Entity__c);
+                 // Added By Smita Panda as part of CRM Unification - Account Management
+              //if((currentAccount.ParentID!=oldAccount.ParentId && currentAccount.Restriction__c == 'EC Restricted') || (currentAccount.ParentID == oldAccount.ParentId && currentAccount.Restriction__c == 'EC Restricted')&& accountHierarchyCheckRecusrive==false){//smita
+                AccountTriggerHelper.accountHierarchy(newAccItems, oldItems);
+                 
+                
+                //added by sandeep FRO-1654
+                accountHierarchyCheckRecusrive = true;
+            }
+
+
+            //Account Status Changes by Account Master FRO-2504
+            if (currentAccount.tfcmCustomerStatus__c != null){
+                AccountTriggerHelper.accountStatusChangeLogic(newAccItems);
+            }
+
+            //Added to change account status to inactive upon TDO or Credit Check Status Failed
+            if (currentAccount.tfcmCustomerStatus__c != 'Failed'){
+                AccountTriggerHelper.accountstatusonTDOCredit(newAccItems, oldItems);
+            }
+            //MTI-2014 -- Start
+            if (currentAccount.Service_Entitlement__c != oldAccount.Service_Entitlement__c){
+                checkserviceEntitlementonupdate(currentAccount, oldAccount);
+            }
+
+
+            //MTI-2014 -- End
+
+
+            User newUser = new User();
+            newUser = currentAccount.owner;
+            User oldUser = oldAccount.owner;
+            mapFieldStatus = TriggerUtility.isFieldChanged(currentAccount, oldAccount, lstFieldToCheckStatus);
+
+            //Production Fix to limit messages to external System - START
+            mapofIntegFields = TriggerUtility.isFieldChanged(currentAccount, oldAccount, listOfIntegFields);
+            //added as part of GTT-2346
+            currentAccount.Exit_Rate__c = currentAccount.Exit_Rate_USD__c != null && currentAccount.Exit_Rate_USD__c > 0 ? true : false;
+            //ended GTT-2346
+
+
+            //Added for GTT-3610
+            if (currentAccount.Addressable__c != oldAccount.Addressable__c && currentAccount.Addressable__c == false){
+                currentAccount.Addressable_IsChanged__c = true;
+            }
+            //Added for CRMU-2031
+            if (currentAccount.KYC_Flag__c != oldAccount.KYC_Flag__c && currentAccount.KYC_Flag__c == false)
+            {
+                    currentAccount.KYC_Status__c = 'Fail'; 
+            }
+
+            for (String fieldname : mapofIntegFields.keyset()){
+
+                //TSV-1399 changes start
+                //Added new OR condition below - GTT-3610
+                if ((mapofIntegFields.get('Open_Opportunity__c') && currentAccount.Open_Opportunity__c == 1 && oldAccount.Open_Opportunity__c == 0 && currentAccount.Addressable__c && currentAccount.Suppress_Sync__c) || (currentAccount.Addressable__c != oldAccount.Addressable__c && !currentAccount.Addressable__c && currentAccount.Suppress_Sync__c))
+                    //TSV-1399 to supress
+                        {
+                        currentAccount.Suppress_Sync__c = false;
+                    system.debug('sync reset to false' + currentAccount.Suppress_Sync__c);
+                }
+                //Logic addedto generate TCID,CAID,OfficeID,cmAddresssId,CompanyID for CMMS-2
+                	
+				  if (currentAccount.T1Customer__c != oldAccount.T1Customer__c && currentAccount.T1Customer__c == true && mapofIntegFields.get('T1Customer__c')){
+                    //Genrating TCID,CAID,Office,companyId and addingt to Account by Shravan CM migratioin
+                    // for officeId,CompanyId if its not populates then it will generate if not use the user provided
+                    if (currentAccount.tfcmCustomerMasterId__c == null){
+                        currentAccount.tfcmCustomerMasterId__c = String.valueOf(Integer.valueOf(Static_Values__c.getInstance('LatestTCID').Value__c) + 1);
+                        isTcidGenerated = true;
+                    }
+                      if (currentAccount.tocCMRelationId__c == null){
+                        currentAccount.tocCMRelationId__c = String.valueOf(Integer.valueOf(Static_Values__c.getInstance('LatestCAID').Value__c) + 1);
+                         isCaidGenerated  = true;
+                      }
+                      if (currentAccount.CMAddressID__c == null){
+                        currentAccount.CMAddressID__c = String.valueOf(Integer.valueOf(Static_Values__c.getInstance('LatestAddressId').Value__c) + 1);
+                          isCmAddGenerated  = true;
+                      }
+
+                }  // CMMS-2end       
+                /*Commented for GTT-3200
+                 // TSV-1403-START
+                 if(mapofIntegFields.get('Open_Opportunity__c') && currentAccount.Addressable__c && currentAccount.Qualification_Status__c != 'Qualified' &&
+                 oldAccount.Open_Opportunity__c == 0 && currentAccount.Open_Opportunity__c == 1)
+                 {
+                 currentAccount.Qualification_Status__c = 'Qualified';
+                 }
+                 //TSV-1403-END
+                 */
+                system.debug('fieldname321' + fieldname);
+                system.debug('currentAccount.Suppress_Sync__c123' + currentAccount.Suppress_Sync__c);
+                if (!currentAccount.Suppress_Sync__c && mapofIntegFields.get(fieldname)){
+                    // TSV-1522 suppress Sync flag added
+                    currentAccount.Re_trigger_date__c = String.valueOf(Datetime.now());
+                    system.debug('test6666');
+                    break;
+                }
+            }
+             //Production Fix to limit messages to external System - END
+
+
+            //Method is to retrict the 'Automated Process' user from making any changes to the account name
+            //during JIT in the single sign on process from AAA for My Account (MTRRestrictAccountNameUpdate)
+            if (mapFieldStatus.get('Name') && (userinfo.getuserid().equalsIgnoreCase(Label.Automated_Process_User_ID_For_SAML_Login) || Test.isRunningTest())){
+                currentAccount.Name = oldAccount.Name;
+            }
+            //last modified date is updated to the current time if the values of field changes (UpdateR90LastModifiedDate)
+            else{
+                lstOFAccountOwnerIDs.add(currentAccount.OwnerId);
+                lstOfAccount.add(currentAccount);
+            }
+
+            //Call the validateShipping method to verify if the country is available
+            //in the Account country picklist(validateShippingCountry)
+            isCountryAvailable = AccountTriggerHelper.validateShipping(currentAccount);
+
+            //If the country is available assign the shipping country to the account country(validateShippingCountry)
+            if (isCountryAvailable && mapFieldStatus.get('ShippingCountry')){
+                if (!String.isBlank(oldAccount.ShippingCountry)){
+                     // NER-1062
+                    currentAccount.tfCrmCountry__c = oldAccount.ShippingCountry;
+                }
+            }
+
+            if (isCountryAvailable){
+                lstAccIdStateValidation.add(currentAccount);
+            }
+
+
+            //Obtain the values of fields that have changed (setOwningPool)
+            if (mapFieldStatus.get('Owning_Pool__c') || mapFieldStatus.get('OwnerId')){
+                System.debug('inside change of owning pool');
+                mapOfAccountToOwnerId.put(currentAccount.Id, currentAccount.OwnerId);
+                /* currentAccount.Owning_Pool__c = null;
+                 if(directPoolMap.size() != 0){
+                 currentAccount.Owning_Pool__c = directPoolMap.get(currentAccount.OwnerId) ;
+                 }*/
+            }
+
+            //If the oppty team info flag is TRUE verify if the owner for the acocunt has changed and add to a set(getopptyteaminfo)
+            if (AccountTriggerHelper.bRunFlag){
+                if (mapFieldStatus.get('OwnerId'))
+                    setAccountWithOwnerIDChanged.add(currentAccount.Id);
+            }
+
+            //From (triggerAccount)
+            if (checkOppIsExecuted){
+                //Add old and new AccountOwnerIds to the List
+                if (mapFieldStatus.get('OwnerId')){
+                    AccountOldOwnerNewOwnerList.add(currentAccount.Id + ';' + oldAccount.OwnerId + ';' + currentAccount.OwnerId);
+                }
+
+                //update Account_Class fields on change of trAccountClass__c
+                if (mapFieldStatus.get('trAccountClass__c')){
+                    Account_Class__c newAccountClass = Account_Class__c.getInstance(currentAccount.trAccountClass__c);
+                    //Commented as paer of sci-972
+                    /*if(newAccountClass != null){
+                     /*
+                     Commented  as part  of TSV-130 Trust Evolve
+                     currentAccount.Customer_Segment__c = newAccountClass.Customer_Segment__c;
+                     currentAccount.Customer_Sub_Segment__c = newAccountClass.Customer_Sub_Segment__c;
+                     currentAccount.AccCls_Relationship_Model__c=newAccountClass.Relationship_Model__c;
+                     *
+                     }*/
+                    //Commented as paer of sci-972
+                }
+                if (currentAccount.isTAMbeforeOpty__c){
+                    currentAccount.isTAMbeforeOpty__c = false;
+                }
+                //Current Account's tocBusiness_Channel__c is 'Media' Update trAccountClass__c is 'Not Set'
+                if (currentAccount.tocBusiness_Channel__c != null && currentAccount.tocBusiness_Channel__c != '' && currentAccount.tocBusiness_Channel__c.equalsIgnoreCase('Media')){
+                    currentAccount.trAccountClass__c = 'Not Set';
+                } else{
+                    //current account was not an ulltimate parent post update become the ultimate parent
+                    //and Update Current trAccountClass__c is 'Not set'
+                    if (currentAccount.Ultimate_Parent_Account__c == null && oldAccount.Ultimate_Parent_Account__c != null){
+                        currentAccount.trAccountClass__c = 'Not Set';
+                    }
+                    /*else if(currentAccount.Ultimate_Parent_Account__c != null && (oldAccount.Ultimate_Parent_Account__c == null
+                     || (oldAccount.Ultimate_Parent_Account__c != null && mapFieldStatus.get('Ultimate_Parent_Account__c') )
+                     || currentAccount.OwnerId != oldAccount.OwnerId)){
+                     //Based on Below Conditions Update trAccountClass__c to UPA_Account_Class__c
+                     currentAccount.trAccountClass__c = currentAccount.UPA_Account_Class__c;
+                     } */
+                }
+            }
+
+            //Update Account flag On Acc(Opportunity Count)(triggerAccount)
+            if (triggerHandlingOFOpportunity.isExecuted){
+                System.debug('@@@@@@@@@@@@Opportunity');
+                if (currentAccount.tocOpenReutersOpportunityCount__c == 1){
+                    currentAccount.isTAMbeforeOpty__c = true;
+                } else if (currentAccount.tocOpenReutersOpportunityCount__c > 1){
+                    currentAccount.isTAMbeforeOpty__c = false;
+                }
+            }
+
+            //If ( the Account status is Prospect or (Active and if the edit account flag field is true )
+            // and if there is any changes in the shipping address then fields are updated correspondingly( AddressValidationForNewAccount)
+            if ((currentAccount.tfcmCustomerStatus__c == 'Prospect' || (currentAccount.tfcmCustomerStatus__c == 'Active' && userFlag)) && (mapFieldStatus.get('ShippingCity') || mapFieldStatus.get('ShippingStreet') || mapFieldStatus.get('ShippingState') || mapFieldStatus.get('ShippingPostalCode') || mapFieldStatus.get('ShippingCountry'))){
+
+                if (oldAccount.Address_Validated__c){
+                    currentAccount.Address_Validated__c = false;
+                } else if (oldAccount.AddressConfirmedByIDQ__c){
+                    currentAccount.AddressConfirmedByIDQ__c = false;
+                } else if (oldAccount.AddressValidationAttempted__c){
+                    currentAccount.AddressValidationAttempted__c = false;
+                }
+
+                if (!oldAccount.Existing_Account__c && !AccountTriggerUtility.checkUserPresent(userInf.Name)){
+                    currentAccount.Existing_Account__c = true;
+                } else if (oldAccount.Existing_Account__c && AccountTriggerUtility.checkUserPresent(userInf.Name)){
+                    currentAccount.Existing_Account__c = false;
+                }
+
+            }
+
+            //TfcmCustomerStatus is assigned to Previous Account Status field
+            currentAccount.Previous_Account_Status__c = oldAccount.tfcmCustomerStatus__c;
+
+            //(triggerAccount)
+            if (AccountTriggerHelper.CAAcreated && currentAccount.tfcmCustomerStatus__c != 'Inactive'){
+                if (mapFieldStatus.get('ShippingCountry') || mapFieldStatus.get('Credit_Check_Status__c') || mapFieldStatus.get('TDO_Status__c') || (currentAccount.All_Opportunities__c == 1 && oldAccount.All_Opportunities__c == 0))
+                    /*(mapFieldStatus.get('Genesis_Flag__c') && currentAccount.Count_Genesis_Opportunity__c > 0)
+                     || (mapFieldStatus.get('GRC_Restrict_Migration_Flag__c') &&
+                     currentAccount.GRC_Restrict_Migration_Opportunity__c > 0) )*/
+                        {
+                        AccountCAAList.add(currentAccount);
+                }
+            }
+
+            //mti-3204
+            if (userGroupMemberMap.get(label.FXALLEntitledGroupName).IsEmpty() && !fxallEntitlementFlag && currentAccount.Service_Entitlement__c == label.account_entitlement && currentUser.ProfileId != Label.SystemAdmin){
+                //to avoid this error on update of opty
+                if (mapFieldStatus.get('Service_Entitlement__c')){
+                    currentAccount.addError(label.FXAll_Entitlement_Error);
+                }
+            }
+
+            //mti-3204 to throw error when non entitled user tries to update service entitlement
+            if (userGroupMemberMap.get(label.FXALLEntitledGroupName).IsEmpty() && !fxallEntitlementFlag && currentUser.ProfileId != Label.SystemAdmin && oldAccount.Service_Entitlement__c == label.account_entitlement && mapFieldStatus.get('Service_Entitlement__c')){
+                currentAccount.addError(label.FXAll_Entitlement_Error);
+            }
+            //Added for PAC(QPA-755) to fetch related billing address if ultimate parent changes
+            if (mapFieldStatus.get('Ultimate_Parent_Account__c')){
+                changedAcc.add(currentAccount.id);
+                system.debug('changes ultimate parent is true' + changedAcc);
+
+            }
+            //end of PAC(QPA-755)
+        }
+        //End of For loop
+        // PAC(QPA-755)
+        //Added as part of TSV-1241
+
+        // List<Partner_Accounts__c> Accounttodel=[select id from Partner_Accounts__c where Id =:delPartnerSet];
+
+
+        if (!partneraccounts.isEmpty()){
+            insert partneraccounts;
+        }
+        if (!changedAcc.isEmpty()){
+            List<tocSubscriber__c> billingAccList = AccountTriggerUtility.getAllBillingAddress(changedAcc);
+            System.debug('Related Billing Accounts----->' + billingAccList);
+            if (!billingAccList.isEmpty()){
+                for (tocSubscriber__c bacc : billingAccList){
+                    //system.debug('Current ultimate parent --->'+currentAccount.Ultimate_Parent_Account__c);
+                    bacc.Root_Account__c = bacc.Ultimate_Parent__c;
+                    billingAccUpdateList.add(bacc);
+                }
+            }
+        }
+        if (!billingAccUpdateList.isEmpty()){
+            system.debug('update billing list is' + billingAccUpdateList);
+            TriggerUtility.objectNames.add('tocSubscriber__c');
+            Update billingAccUpdateList;
+        }
+        //end PAC(QPA-755)
+        // Updating Custom setting for TCID,CAID for CMMS-2
+		if (isTcidGenerated  == true){
+            Static_Values__c tcidSetting = Static_Values__c.getInstance('LatestTCID');
+				tcidSetting.Value__c = String.valueOf(Integer.valueOf(tcidSetting.Value__c) + 1);
+					update tcidSetting;
+        			}
+        if (isCaidGenerated   == true){
+					Static_Values__c caiddSetting = Static_Values__c.getInstance('LatestCAID');
+				caiddSetting.Value__c = String.valueOf(Integer.valueOf(caiddSetting.Value__c) + 1);
+					update caiddSetting;
+        }
+        if (isCmAddGenerated   == true){
+                Static_Values__c cmAddressIdSetting = Static_Values__c.getInstance('LatestAddressId');
+				cmAddressIdSetting.Value__c = String.valueOf(Integer.valueOf(cmAddressIdSetting.Value__c) + 1);
+					update cmAddressIdSetting;
+
+        }
+        //associate direct pool record and user Id
+        if (mapOfAccountToOwnerId.size() != 0){
+            for (Direct_Pool__c directPoolRecord : AccountTriggerUtility.getAllDirectPoolRecords(mapOfAccountToOwnerId.values())){
+                directPoolMap.put(directPoolRecord.Generic_User__r.Id, directPoolRecord.Id);
+            }
+        }
+        //Direct pool Id is assigned to owning poolm field
+        for (Account currentAccount : newAccItems){
+            if (mapOfAccountToOwnerId.containskey(currentAccount.Id)){
+                if (directPoolMap.containskey(currentAccount.OwnerId)){
+                    currentAccount.Owning_Pool__c = directPoolMap.get(currentAccount.OwnerId);
+                } else{
+                    currentAccount.Owning_Pool__c = null;
+                }
+            }
+        }
+
+        System.debug('Outside the AccountCAAlist1');
+        //Creates Account_Activity Records. (triggerAccount)
+        if (AccountCAAList.size() != 0){
+            AccountTriggerHelper.genCreateCAA(AccountCAAList, newItems, oldItems);
+            System.debug('Inside the AccountCAAlist1');
+        }
+
+        /*Below conditions checks for whether TDO or Credit Check is required for a Location Account on the basis
+         of its Shipping Country. The Country and whether TDO/Credit Check is required for it or not is stored in
+         a Custom Setting "GenesisNewMyAccountUserQueues__c".
+
+         If the Country doesnot required TDO/Credit Check to be done, the TDO and Credit Check Status fields hold the
+         values as "Not Applicable"*/
+
+
+        for (Account currentAccount : newAccItems){
+
+            if (!(currentAccount.ShippingCountry.contains('Congo, The Democratic Republic of the'))){
+                if ((GenesisNewMyAccountUserQueues__c.getall().get(currentAccount.ShippingCountry) != null) && !(GenesisNewMyAccountUserQueues__c.getall().get(currentAccount.ShippingCountry).Credit_Check_Required__c)){
+                    currentAccount.Credit_Check_Status__c = 'Not Applicable';
+                }
+
+                if ((GenesisNewMyAccountUserQueues__c.getall().get(currentAccount.ShippingCountry) != null) && !(GenesisNewMyAccountUserQueues__c.getall().get(currentAccount.ShippingCountry).TDO_Required__c)){
+                    currentAccount.TDO_Status__c = 'Not Applicable';
+                }
+            } else{
+                if ((GenesisNewMyAccountUserQueues__c.getall().get(currentAccount.ShippingCountry) != null) && !(GenesisNewMyAccountUserQueues__c.getall().get('Congo, The Democratic Republic').Credit_Check_Required__c)){
+                    currentAccount.Credit_Check_Status__c = 'Not Applicable';
+                }
+
+                if (!(GenesisNewMyAccountUserQueues__c.getall().get('Congo, The Democratic Republic').TDO_Required__c)){
+                    currentAccount.TDO_Status__c = 'Not Applicable';
+                }
+            }
+
+        }
+
+        //If the current user is not a GRC Inactive User and the country is available
+        //then call the  below method to validate the shipping state (validateShippingCountry)
+        if (UserInfo.getName() != Label.GrcInactiveUserName && isCountryAvailable){
+            //it checks the state validation for every account
+            //GRCAccountValidation.stateValidation(lstAccIdStateValidation);
+            AccountTriggerHelper.GRCAccountValidation(lstAccIdStateValidation);
+        }
+
+        //(triggerAccount)
+        //Commented as paer of sci-972
+        /*if(setAccountWithOwnerIDChanged != null && setAccountWithOwnerIDChanged.size() != 0){
+         //  AccountTriggerHelper.accountTeamHistoryUpdate(setAccountWithOwnerIDChanged);
+         } */
+        //Commented as paer of sci-972
+        //(triggerAccount)
+        if (checkOppIsExecuted){
+            AccountTriggerHelper.beforeUpdateInsertAccount(newAccItems, oldAccItems, false, AccountOldOwnerNewOwnerList);
+        }
+
+        //To validate whether the user is Valid Acount Manager or not(setOwningPool)
+        if (mapOfAccountToOwnerId.size() != 0){
+            AccountTriggerHelper.validAccountManager(mapOfAccountToOwnerId.values(), newAccItems, oldItems, trConstantSet);
+        }
+
+        System.debug(lstOFAccountOwnerIDs.size());
+
+        //To check if owner fields for the associated accounts have changed
+        /*if(lstOFAccountOwnerIDs.size()!=0){
+
+         }*/
+
+        /* TO get the accounts with countrycodes
+         Add the accounts to a list*/
+        // Add to this list if country code is changed
+        /*map<Id, Account> MapofAccountIds= new map<Id, Account>();// map<id, acc>
+         for(Account newAccountCountryCode : newAccItems){
+         Account oldAccountCountrycode =  (Account)oldItems.get(newAccountCountryCode.ID);
+         system.debug(newAccountCountryCode.id);
+         if(newAccountCountryCode.tfcmCountryCode__c != oldAccountCountrycode.tfcmCountryCode__c){
+         MapofAccountIds.put(newAccountCountryCode.Id,newAccountCountryCode); // if((newAccountCountryCode!=null)){//Compare old and new values of Country Code// pass the set ids     // If changed call the method CheckCOuntryCodetoUpdateRefinitivSubMarket
+         System.debug('Changed'+newAccountCountryCode.Id);
+         }
+         }
+         if(MapofAccountIds.size()>0){
+         UpdateRefinitivSubMarket(MapofAccountIds);
+         }*/
+    }
+
+    //end of genericBeforeUpdate
+    /*********************************************************************************************
+     Common method to execute the before insert functionalities
+     ----------------------------------------------------------------------------------------------
+     Functionalities Implemented:
+     1. To prevent creation of new Account if the user is 'TF Integration'
+     2. To populate the owning pool field value in Account
+     3. Update Account fields with the Account_Class Custom Setting Values based in Condition
+     4. To Validate whether the user is Valid Account Manager or not.
+     5. To validate shipping country and shipping city on created new Account
+     6. To check if Account is created during Lead Conversion or through Batch Load and change
+     the Account fields correspondingly
+     7. MTI-2014 : To check if customer is entitled to Create an account with Service entitlement
+     ************************************************************************************************/
+    // Start Generic Before insert Method
+    public static void genericBeforeInsert(List<SObject> newItems){
+        System.debug('@@@@@@@@@@@@@@@@@@@@@@@@@@@@genericBeforeInsert');
+        List<Id> ownerIds = new List<Id>();
+        Map<Id, Id> directPoolMap = new Map<Id, Id>();
+        boolean isCountryAvailable = true;
+        boolean isT1checked = false; // added for CMMS-2 CM migration
+        Boolean isInsertOperation = Trigger.isInsert;
+        List<Account> lstAccIdStateValidation = new List<Account>();
+
+        Set<String> trConstantset = new Set<String>();
+        Map<String, trConstants__c> mapOfConstants = AccountTriggerUtility.getTrConstants();
+        List<Id> lstOwnerIds = new List<Id>();
+
+        //get the user details for the current context user
+        User currentUser = TriggerUtility.getUserRecord();
+        boolean userFlag = currentUser.Edit_Active_Account_Flag__c;
+
+
+        //To obtain the List of values for profile name 'Profile_Excluded_Transfer'
+        for (trConstants__c objConstant : mapOfConstants.values()){
+            if (objConstant.name.contains('Profile_Excluded_Transfer')){
+                trConstantset.add(objConstant.Value__c);
+            }
+        }
+
+        //Map Direct pool Id and Owner Id (setOwningPool)
+        for (Direct_Pool__c directPools : AccountTriggerUtility.getAllDirectPoolRecords(new List<Id>())){
+            System.debug('in direct pool' + directpools);
+            directPoolMap.put(directPools.Generic_User__r.Id, directPools.Id);
+        }
+
+        //Call PAC method to uldate commercial model
+        AccountTriggerHelper.PACupdateonaccount(newItems);
+
+        //To Check if Trigger handler of Opportunity is executed
+        Boolean checkOppIsExecuted = (!triggerHandlingOFOpportunity.isExecuted);
+
+        //Account Status Changes by Account Master FRO-2504
+        if (isInsertOperation){
+            AccountTriggerHelper.accountStatusChangeLogic(newItems);
+        }
+    
+        //Iterate through each Account
+        for (Account currentAccount : (List<Account>)newItems){
+            /* if(currentAccount.Addressable__c){// TSV-1522 BLOCK STARTS
+             currentAccount.Suppress_Sync__c= true;
+
+             }*/// TSV-1522 BLOCK ENDS
+            //SML-51 Lead convert JS validations moved here.
+
+            if (currentAccount.Converted_From_Lead__c == TRUE){
+                if (UserInfo.getUiThemeDisplayed() != 'Theme3'){
+                    currentAccount.ShippingCity = currentAccount.BillingCity = (currentAccount.BillingCity == '' || currentAccount.BillingCity == null ? '-' : currentAccount.BillingCity);
+                    currentAccount.ShippingStreet = currentAccount.BillingStreet = (currentAccount.BillingStreet == '' || currentAccount.BillingStreet == null ? '-' : currentAccount.BillingStreet);
+                    currentAccount.ShippingPostalCode = currentAccount.BillingPostalCode = (currentAccount.BillingPostalCode == '' || currentAccount.BillingPostalCode == null ? '-' : currentAccount.BillingPostalCode);
+                }
+                currentAccount.ShippingCountry = currentAccount.BillingCountry;
+            }
+            //SML-51 Ends here after shipping country change
+
+            //MTI-2014 Start-- Service entitlement access for limited users
+
+            if (currentAccount.Service_Entitlement__c != null){
+                checkserviceEntitlementoninsert(currentAccount);
+            }
+            //MTI-2014 End
+
+            //add owner ids to List
+            lstOwnerIds.add(currentAccount.OwnerId);
+
+            if (!AccountTriggerUtility.checkUserPresent(currentUser.Name)){
+                //Checks if Account created during Lead Conversion or through Batch Load
+                If (!currentAccount.Converted_From_Lead__c && !System.isBatch()){
+                    currentAccount.Existing_Account__c = true;
+                }
+            }
+
+            //If the user is TF Integration and TCId is Not Null then it throws error ( PreventCMAccountCreation)
+            if (currentAccount.tfcmCustomerMasterId__c != null && currentUser.name.equalsIgnoreCase('TF Integration')){
+                currentAccount.addError(label.Account_Creation_In_Trust_Only);
+            }
+
+            //Assign the direct pool Id assoiated to the context user to owning pool field(setOwningPool)
+            if (directPoolMap.containskey(currentAccount.OwnerId)){
+                System.debug('if directpool map >0' + directPoolMap.get(currentAccount.OwnerId));
+                currentAccount.Owning_Pool__c = directPoolMap.get(currentAccount.OwnerId);
+            } else{
+                currentAccount.Owning_Pool__c = null;
+            }
+
+            //method call to validateshipping country , it returns true if country is valid (validateShippingCountry)
+            isCountryAvailable = AccountTriggerHelper.validateShipping(currentAccount);
+
+            if (isCountryAvailable){
+                currentAccount.tfCrmCountry__c = currentAccount.ShippingCountry;
+                lstAccIdStateValidation.add(currentAccount);
+            }
+
+            //Update Account fields with the Account_Class Custom Setting Values based in Condition (triggeraccount)
+            if (checkOppIsExecuted){
+                Account_Class__c newAccountClass = Account_Class__c.getInstance(currentAccount.trAccountClass__c);
+
+                //if (newAccountClass != null){//commenting empty if to resolve codescan issue facing during deployment
+                    /*
+                     Commented  as part  of TSV-130 Trust Evolve
+                     currentAccount.Customer_Segment__c = newAccountClass.Customer_Segment__c;
+                     currentAccount.Customer_Sub_Segment__c = newAccountClass.Customer_Sub_Segment__c;
+                     currentAccount.AccCls_Relationship_Model__c = newAccountClass.Relationship_Model__c;
+
+                     */
+                //}
+                //Generating TCID,officeId,CompanyId,CAID,cmAddressId For CMMS-2 
+                // for officeId,CompanyId if its not populates then it will generate if not use the user provided
+                if (currentAccount.T1Customer__c == TRUE){
+                        currentAccount.tfcmCustomerMasterId__c =  String.valueOf(Integer.valueOf(Static_Values__c.getInstance('LatestTCID').Value__c) + 1);
+                        currentAccount.tocCMRelationId__c = String.valueOf(Integer.valueOf(Static_Values__c.getInstance('LatestCAID').Value__c) + 1);
+                    currentAccount.CMAddressID__c = String.valueOf(Integer.valueOf(Static_Values__c.getInstance('LatestAddressId').Value__c) + 1);
+                    isT1checked = true;
+                }
+
+                // End CMMS-2
+                //If Account Bussiness Channel is 'Media' , then Set TRAccountClass field to 'Not Set'
+                if (currentAccount.tocBusiness_Channel__c != '' && currentAccount.tocBusiness_Channel__c != null && currentAccount.tocBusiness_Channel__c.equalsIgnoreCase('Media')){
+                    currentAccount.trAccountClass__c = 'Not Set';
+                } else if (currentAccount.Ultimate_Parent_Account__c != null){
+                    currentAccount.trAccountClass__c = currentAccount.UPA_Account_Class__c;
+                }
+            }
+
+            //added as part of GTT-2346
+            if (currentAccount.Exit_Rate_USD__c != null){
+                currentAccount.Exit_Rate__c = currentAccount.Exit_Rate_USD__c > 0 ? true : false;
+            }
+             //ended GTT-2346
+
+            //added as part of MTI-3204
+            if (userGroupMemberMap.get(label.FXALLEntitledGroupName).IsEmpty() && !fxallEntitlementFlag && currentAccount.Service_Entitlement__c == label.account_entitlement && currentUser.ProfileId != Label.SystemAdmin){
+                currentAccount.addError(label.FXAll_Entitlement_Error);
+            }
+
+            //[QPA-15857]
+            //Default Price Increase Month if empty: April for Japan, January for the rest of shipping countries
+            if (String.isBlank(currentAccount.Price_Increase_Month__c)){
+                if (currentAccount.ShippingCountry == 'Japan'){
+                    currentAccount.Price_Increase_Month__c = 'April';
+                } else{
+                    currentAccount.Price_Increase_Month__c = 'January';
+                }
+            }
+            system.debug('currentAccount@@@:' + currentAccount);
+        }
+         // End of For Loop
+        //Updating new TCID AND CAID in custem settings For CMMS-2
+        if (isT1checked == true){
+            Static_Values__c tcidSetting = Static_Values__c.getInstance('LatestTCID');
+				tcidSetting.Value__c = String.valueOf(Integer.valueOf(tcidSetting.Value__c) + 1);
+					update tcidSetting;
+					Static_Values__c caiddSetting = Static_Values__c.getInstance('LatestCAID');
+				caiddSetting.Value__c = String.valueOf(Integer.valueOf(caiddSetting.Value__c) + 1);
+					update caiddSetting;
+                Static_Values__c cmAddressIdSetting = Static_Values__c.getInstance('LatestAddressId');
+				cmAddressIdSetting.Value__c = String.valueOf(Integer.valueOf(cmAddressIdSetting.Value__c) + 1);
+					update cmAddressIdSetting;
+        }
+        //If the country is valid , then it validates the state
+        If (UserInfo.getName() != Label.GrcInactiveUserName && isCountryAvailable){
+            //GRCAccountValidation.stateValidation(lstAccIdStateValidation);
+            AccountTriggerHelper.GRCAccountValidation(lstAccIdStateValidation);
+        }
+
+        if (checkOppIsExecuted){
+            AccountTriggerHelper.beforeUpdateInsertAccount(newItems, null, true, null);
+        }
+
+        //To validate whether the user is Valid Acount Manager or not
+        if (lstOwnerIds.size() != 0){
+            AccountTriggerHelper.validAccountManager(lstOwnerIds, newItems, null, trConstantSet);
+        }
+    }
+
+    //end of genericBeforeInsert
+    /*********************************************************************************************
+     Common method to execute the after update functionalities
+     ----------------------------------------------------------------------------------------------
+     Functionalities Implemented:
+     1. If the Account fields CJR or Siebel Id are updated in account,a mail will be sent to contact whose lastname
+     is 'CJRUpdate' with the Account details
+     2. It sends email notification present in MTRFELMPackHelper class
+     3. Publish Lead Converted contact to DSS after account successfull flow to DSS.(Devaki)
+     ************************************************************************************************/
+    //Start of genericAfterUpdate
+    public static void genericAfterUpdate(Map<Id, SObject> newItems, Map<Id, SObject> oldItems){
+        System.debug(LoggingLevel.ERROR, 'AccountTriggerGenericHelper.genericAfterUpdate');
+
+        String interfaceswitch = Label.CONTACT_INTERFACE;
+
+        List<Account> newAccItems = (List<Account>)newItems.values();
+        List<Account> oldAccItems = (List<Account>)oldItems.values();
+        List<ID> TAMAccIDList = new List<ID>();
+        List<Account> accountCAAList = new List<Account>();
+        List<Account> lstAccCJRUpdate = new List<Account>();
+        Map<Id, String> mapAccountIDtoError = new Map<Id, String>();
+        List<ID> LeadAccIDList = new List<ID>();
+
+        //Initialises a List of account ids
+        List<Id> lstOfAccIdForEmail = new List<Id>();
+
+        Set<Id> setAccId = new Set<Id>();
+        Map<Id, Id> mapAccIdwithOwnerId = new Map<Id, Id>();
+        //set<Id> setOfaccountIds = new set<Id>();
+        Set<Id> accountSet = new Set<Id>();
+        Set<Id> accountStatusChangedToActive = new Set<Id>();
+
+        List<Messaging.SingleEmailMessage> eMaiList = new List<Messaging.SingleEmailMessage>();
+
+        Boolean recursionFlag = CJRUpdate.runOnce();
+
+        //List of trContstants with 'Generic_User' name
+        List<trConstants__c> trConstants = new List<trConstants__c>();
+        Set<String> trConstantset = new Set<String>();
+        Map<String, trConstants__c> mapOfConstants = AccountTriggerUtility.getTrConstants();
+        List<tocSubscriber__c> billingAccList = new List<tocSubscriber__c>();
+        List<Opportunity> oppLst = new List<Opportunity>();
+        Map<Id, Account> AccountMapWithAccId = new Map<Id, Account>();
+
+        List<BatchJob_Tracker__c> BatchJobList = new List<BatchJob_Tracker__c>();  //to add batch job tracker into List to insert
+        
+        // Update Related Billing Accounts when a Location Account's Ultimate Parent Account is updated -- SFCF-2128--Shreekara P S--
+        
+            List<Account> UPAupdatedAccounts = new List<Account>();
+            for(Account newAcc : newAccItems){
+                Account oldAcc = (Account) oldItems.get(newAcc.ID);
+                if(oldAcc.Ultimate_Parent_Account__c != newAcc.Ultimate_Parent_Account__c){
+                    UPAupdatedAccounts.add(newAcc);
+                }
+            }
+          if(!Test.isRunningTest())
+            if(UPAupdatedAccounts != null){
+                List<tocSubscriber__c> billingAccountList = [Select Id,Root_Account__c, Root_Account__r.Id, Account__r.Ultimate_Parent_Account__r.Id from tocSubscriber__c where Account__r.Id in: UPAupdatedAccounts];
+                if(billingAccountList != null){
+                    for(tocSubscriber__c billingAcc: billingAccountList){
+                    billingAcc.Root_Account__c = billingAcc.Account__r.Ultimate_Parent_Account__r.Id;
+                    }
+                }
+                update billingAccountList;
+        }
+        // --End of SFCF-2128 changes--
+        
+        // ECOMMERCE- Re-trigger SAP integration upon the Legal Entity checked accounts are successfully integrated with SAP
+        retriggerSAPOnEcomSpecificBillingAccounts(newItems, oldItems);
+
+        //getting if trContstants with 'Generic_User' name
+
+        if (interfaceswitch == 'ON'){
+            for (trConstants__c objConstant : mapOfConstants.values()){
+                if (objConstant.name.contains('Generic_User')){
+                    trConstantset.add(objConstant.Value__c);
+                }
+            }
+        }
+		
+        List<Account> acntsToUpdateList = new List<Account>();//added for CRMU-831,CRMU-954,CRMU-1119
+        
+        //Iterate through each Account record
+        for (Account currentAccount : newAccItems){
+            Account oldAccount = (Account) oldItems.get(currentAccount.ID);
+			
+            //====start added for CRMU-831,CRMU-954,CRMU-1119=====
+            Account acnt = (Account)updateAccountRecordRegion(currentAccount,oldAccount);
+            if(acnt != null)
+             	acntsToUpdateList.add(acnt);
+            system.debug('@@acntsToUpdateList:'+acntsToUpdateList);
+            //====end added for CRMU-831,CRMU-954,CRMU-1119=====
+            
+            if (currentAccount.ShippingCountry != oldAccount.ShippingCountry && oldAccount.ShippingCountry != null){
+                AccountMapWithAccId.put(currentAccount.Id, currentAccount);
+            }
+
+            //Obtain the values of fields that have changed
+            List<String> lstFieldToCheckStatus = new List<String>{ 'Genesis_Migration_Status__c', 'ParentId', 'ELM_Send_Email__c', 'CJR__c', 'Siebel_Id__c', 'Ownerid', 'ParentId', 'tfcmCustomerStatus__c', 'shippingcountry', 'Credit_Check_Status__c', 'TDO_Status__c', 'Genesis_Flag__c', 'GRC_Restrict_Migration_Flag__c' };
+            Map<String, Boolean> mapFieldStatus = TriggerUtility.isFieldChanged(currentAccount, oldAccount, lstFieldToCheckStatus);
+            //checks if there are any changes in the Genesis_Migration_Status__c and ELM_Send_Email__c fields
+            //and adds it to the lstAccId List (    MTRSendELMPack)
+            if (currentAccount.Genesis_Migration_Status__c != null && currentAccount.Genesis_Migration_Status__c.tolowercase() == System.label.MTRF_Acc_Migration_Status && currentAccount.ELM_Send_Email__c != null && currentAccount.ELM_Send_Email__c && (mapFieldStatus.get('Genesis_Migration_Status__c') || mapFieldStatus.get('ELM_Send_Email__c'))){
+
+                lstOfAccIdForEmail.add(currentAccount.Id);
+            }
+
+            if (mapFieldStatus.get('Ownerid')){
+
+                System.debug('value of AggregateResult' + currentAccount.All_Opportunities__c);
+
+                integer noOfOpty = integer.valueOf(TRUST_Constants__c.getOrgDefaults().maximum_opty_records__c);
+                String errormsg = TRUST_Constants__c.getOrgDefaults().Error_message_for_acc_owner_change__c;
+
+                if (currentAccount.All_Opportunities__c < noOfOpty){
+
+                    mapAccIdwithOwnerId.put(currentAccount.Id, oldAccount.OwnerId);
+
+                    System.debug('Map owner check' + mapAccIdwithOwnerId);
+                    BatchJob_Tracker__c bjt = new BatchJob_Tracker__c(AccountId__c = currentAccount.Id, BatchJob_Name__c = 'AccountOwnerCaseShare');
+                    BatchJobList.add(bjt);
+                } else{
+                    currentAccount.addError(errormsg);
+                }
+            }
+
+            //If account OwnerId has not udated call the method 'updateSalesTeamHistory' of AccountTriggerHelper (getopptyteaminfo)
+            if (!mapAccIdwithOwnerId.IsEmpty() && AccountTriggerHelper.bRunFlag){
+                System.debug('entering accgenhelp' + mapAccIdwithOwnerId);
+                AccountTriggerHelper.updateSalesTeamHistory1(mapAccIdwithOwnerId);
+            }
+
+            if (mapAccountIDtoError.size() > 0){
+                //If Account's Shipping adress associated to an oppty changes then add error
+                if (mapAccountIDtoError.get(currentAccount.Id) != null){
+                    currentAccount.addError(mapAccountIDtoError.get(currentAccount.Id));
+                }
+            }
+
+            //To avoid the recursion it throws the flag value from CJRUpdate method
+            if (recursionFlag){
+                // If CJR or Siebel Id fields have updated then add to the List lstAccCJRUpdate
+                if ((mapFieldStatus.get('CJR__c') || mapFieldStatus.get('Siebel_Id__c')) && currentAccount.CJR__c != null){
+                    lstAccCJRUpdate.add(currentAccount);
+                }
+            }
+
+            /* Inactivation of Redundant code - SCI-494
+             //(triggeraccount)
+             if(!trConstantset.contains(UserInfo.getUserId()))
+             {
+             // if old Account Number is empty or Null and New Account Number is empty or Null then add to AccountId List
+             if((oldAccount.AccountNumber == null || oldAccount.AccountNumber == '') && (currentAccount.AccountNumber != null && currentAccount.AccountNumber != ''))
+             {
+             setOfaccountIds.add(currentAccount.Id);
+             System.debug('setOfaccountIds'+currentAccount.Id);
+             }
+             }
+             */
+            //Checking ischanged with old accounts and
+            //if Values are changed add to AccountSet and accountStatusChangedToActive List
+            if ((mapFieldStatus.get('ParentId') && currentAccount.ParentId != null))
+                accountSet.add(currentAccount.Id);
+            //Checking ischanged with old accounts if True add Current Account to accountStatusChangedToActive List
+            if (mapFieldStatus.get('tfcmCustomerStatus__c') && currentAccount.tfcmCustomerStatus__c == 'Active')
+                accountStatusChangedToActive.add(currentAccount.Id);
+            if (AccountTriggerHelper.CAAcreated && currentAccount.tfcmCustomerStatus__c != 'Inactive'){
+                if (mapFieldStatus.get('shippingcountry') || mapFieldStatus.get('Credit_Check_Status__c') || mapFieldStatus.get('TDO_Status__c') || (currentAccount.All_Opportunities__c == 1 && oldAccount.All_Opportunities__c == 0))
+                    /*(mapFieldStatus.get('Genesis_Flag__c') && currentAccount.Count_Genesis_Opportunity__c > 0)
+                     || (mapFieldStatus.get('GRC_Restrict_Migration_Flag__c') && currentAccount.GRC_Restrict_Migration_Opportunity__c > 0) )*/
+                        {
+                        AccountCAAList.add(currentAccount);
+                }
+            }
+            //GTT TAM Changes:
+            //Removed check on Addressable flag - GTT-3610
+            //if(currentAccount.Siebel_Id__c != null && !currentAccount.Suppress_Sync__c && (currentAccount.Addressable__c || currentAccount.Addressable_IsChanged__c))
+            if (currentAccount.Siebel_Id__c != null && currentAccount.Siebel_Id__c != oldAccount.Siebel_Id__c && !currentAccount.Suppress_Sync__c){
+                System.debug('insdie if');
+                TAMAccIDList.add(currentAccount.id);
+            }
+            if (currentAccount.Siebel_Id__c != null && mapFieldStatus.get('Siebel_Id__c') && currentAccount.Converted_From_Lead__c == true){
+                System.debug('CallPublishLead Siebel Id' + currentAccount.Siebel_Id__c);
+                System.debug('CallPublishLead AccId' + currentAccount.id);
+                LeadAccIDList.add(currentAccount.id);
+
+            }
+        }
+        //end of for loop
+        
+        //============Start Move 'Update Account Record Region' flow code in trigger CRMU-831,CRMU-954,CRMU-1119=====
+        system.debug('@@acntsToUpdateList_1:'+acntsToUpdateList);
+        if(acntsToUpdateList !=null && acntsToUpdateList.size() > 0) {
+            TriggerUtility.objectNames.add('Account');
+			//AccountTriggerHandler.TriggerDisabled = TRUE;
+            update acntsToUpdateList;
+        }
+        //============End Move 'Update Account Record Region' flow code in trigger CRMU-831,CRMU-954,CRMU-1119=====
+        
+        //TAM Changes:
+        if (!TAMAccIDList.isEmpty() && TAMAccIDList.size() > 0){
+            PropagateTAMAccountContacts(TAMAccIDList);
+        }
+
+        //Devaki SFCF-746
+        if (!LeadAccIDList.isEmpty() && LeadAccIDList.size() > 0){
+            PublishLeadContact(LeadAccIDList);
+        }
+        //get all Opportunity with Account Shipping is changed and check opp.Lead Source is Client Referal
+        //then Opp.tocLead_Account__c  field with AccountId (triggeraccount)
+        if (!AccountMapWithAccId.isEmpty()){
+            mapAccountIDtoError = AccountTriggerHelper.updateOptyAccCounLeadAcc(AccountMapWithAccId);
+            // GTT-910
+            for (Account currentAccount : newAccItems){
+                if (mapAccountIDtoError != null && mapAccountIDtoError.size() > 0){
+                    //If Account's Shipping adress associated to an oppty changes then add error
+                    if (mapAccountIDtoError.get(currentAccount.Id) != null && mapAccountIDtoError.get(currentAccount.Id) == 'field integrity exception'){
+                        currentAccount.addError('You cannot change Account currency when the associated Opportunity has Product Line Items ');
+
+                    } else{
+
+                        currentAccount.addError(mapAccountIDtoError.get(currentAccount.Id));
+                    }
+                }
+
+            }
+        }
+
+        //Creates Account_Activity Records.
+        if (AccountCAAList.size() != 0){
+            AccountTriggerHelper.genCreateCAA(AccountCAAList, newItems, oldItems);
+            System.debug('Inside the AccountCAAlist');
+        }
+
+        //method call to AccToMTREmailNotification for sending email notification present in AccountTriggerHelper class
+        //This Method gets the values iof the required fields needed for sending email notification
+        if (!lstOfAccIdForEmail.isempty()){
+            AccountTriggerHelper.AccToMTREmailNotification(lstOfAccIdForEmail);
+        }
+        /* Inactivation of redundant code - SCI-494
+         //Checking if trConstantset List is not exist with Current User
+         if(!trConstantSet.contains(UserInfo.getUserId())){
+         if(setOfaccountIds.size()> 0){
+         List<Trigger_Object__c> toBePublishedContacts = new List<Trigger_Object__c>();
+         // iterate contact records with AccountId and tocContact_ID__c = Null
+         //And Create New Trigger_Object__c record with Contact data
+         for (Contact conToUpdateInTrigObj: AccountTriggerUtility.getContactList(setOfaccountIds)){
+         Trigger_Object__c TROB = new Trigger_Object__c();
+         TROB.Subject__c = 'Contact:>' + conToUpdateInTrigObj.Id;
+         TROB.Body_Text__c = 'Contact';
+         TROB.Object_Id__c = conToUpdateInTrigObj.Id;
+         TROB.Object_Name__c = 'Contact';
+         tobepublishedContacts.add(TROB);
+         }
+         if(tobepublishedContacts != null && tobepublishedContacts.size() > 0){
+         insert  tobepublishedContacts;
+         }
+         }
+         }
+         */
+
+        //Getting Map of account ids and parent account if old acc Parent is NUll(triggeraccount)
+        Map<Id, Id> childWithParentAcc = new Map<Id, Id>();
+        if (!accountSet.isEmpty()){
+            for (Account acc : AccountTriggerUtility.getChildAccWithParentAcc(accountSet)){
+
+                Account accountOldItem = (Account) oldItems.get(acc.Id);
+                if (accountOldItem.parentid != null){
+                    System.debug('Inside loop for prent not null');
+                    if (!accountOldItem.parent.Legal_Entity__c){
+                        childWithParentAcc.put(acc.Id, acc.ParentId);
+                    }
+                } else{
+                    childWithParentAcc.put(acc.Id, acc.ParentId);
+                }
+            }
+        }
+
+        //Getting tocSubscriber__c records with Account tfcmCustomerStatus__c Id Active
+        //and make Account_Status__c is Active(triggeraccount)
+        if (!accountStatusChangedToActive.isEmpty()){
+            for (tocSubscriber__c subsc : AccountTriggerUtility.getTocSubscriber(accountStatusChangedToActive)){
+                subsc.Account_Status__c = 'Active';
+                billingAccList.add(subsc);
+            }
+        }
+
+        //getOppChildWithParAcc consists of Account's parent!=Null,parent.Legal_Entity__c != True(triggeraccount)
+        System.debug('1111111111111111111111111' + childWithParentAcc);
+        if (childWithParentAcc.keySet().size() > 0){
+            for (Opportunity opp : AccountTriggerUtility.getOppChildWithParAcc(childWithParentAcc)){
+                Opportunity newopp = new Opportunity(Id = opp.Id, AccountAssociatedWith__c = opp.AccountId, AccountId = childWithParentAcc.get(opp.AccountId));
+                oppLst.add(newopp);
+            }
+        }
+
+        //Update Opportunity 'oppLst' List
+        try{
+            if (oppLst.size() > 0){
+                Database.update (oppLst);
+            }
+        } catch (Exception Ex){
+            system.debug('Exception Block');
+        }
+
+        //Update tocSubscriber__c 'billingAccList' data
+        if (billingAccList.size() > 0){
+            Database.update (billingAccList);
+        }
+
+        if (lstAccCJRUpdate.size() != 0){
+            emailist = AccountTriggerHelper.mailSendingCJRUpdate(lstAccCJRUpdate);
+        }
+
+        System.debug('@@@@@@@@@@@@@@@@@@@@' + emailist);
+
+        // If email List is not empty the mail will sent to contact
+        if (eMaiList != null && eMaiList.size() != 0 && !Test.isRunningTest()){
+            Messaging.SendEmailResult[] sendMails = Messaging.sendEmail(eMaiList);
+        }
+
+        //Start @Suraj gupta on 24-04-2018
+        if (BatchJobList != null && !BatchJobList.isEmpty() && TriggerUtility.ExecuteTriggerEvent('CaseShareBJInsert')){
+            System.debug('BatchJobList' + BatchJobList);
+            insert BatchJobList;
+        }
+
+        List<PermissionSetAssignment> datamigruser = new List<PermissionSetAssignment>();
+
+        if (datamigruserId == null || datamigruserId.size() == 0){
+            //Start SFCF-1274
+            datamigruser = TriggerUtility.getDataMigrationUser();
+            // datamigruser=[Select AssigneeId FROM PermissionSetAssignment WHERE PermissionSet.Name = 'Data_Migration_Permission'];
+            //End SFCF-1274
+        }
+
+        for (PermissionSetAssignment vPSA : datamigruser){
+            datamigruserId.add(vPSA.AssigneeId);
+        }
+
+        if (contextUserId != UserInfo.getUserId() || contextUser == null){
+            //Start SFCF-1274
+            contextUser = currentUser;
+            //contextUser=[Select Name,Full_Name__c,Migration_User__c from User where Id=:UserInfo.getUserId()];
+            //End SFCF-1274
+        }
+        
+        for (Account a : newAccItems){
+            Account accountOldItem = (Account) oldItems.get(a.Id);
+
+            String contextUsername = UserInfo.getUserName();
+
+            System.debug(LoggingLevel.ERROR, 'User Id of Context User in AccountTriggerGenericHelper.genericAfterUpdate is: ' + contextUserId);
+            System.debug(LoggingLevel.ERROR, 'Value of contextUsername in AccountTriggerGenericHelper.genericAfterUpdate: ' + contextUsername);
+            System.debug(LoggingLevel.ERROR, 'Value of contextUser in AccountTriggerGenericHelper.genericAfterUpdate: ' + contextUser);
+
+            if (!contextUsername.contains(Label.NonTriggeringAdmin_Username) && UserInfo.getName() != Label.InactiveAccountContactUser && !contextUsername.contains(Label.SiebelEAI_Username) && !contextUsername.contains(Label.Batch_username) && !contextUsername.contains(Label.SiebelEAI_Username) && !contextUsername.contains(Label.TFIntegration_username) && contextUser.Migration_User__c == false && contextUser.Full_Name__c != Label.Data_Migration_label && !contextUsername.contains('cdm')){
+                System.debug(LoggingLevel.ERROR, 'Entered Username check block in AccountTriggerGenericHelper.genericAfterUpdate()');
+
+                boolean dataMigrationExp = datamigruserId.contains((Id) UserInfo.getUserId()) ? false : true;
+
+                System.debug(LoggingLevel.ERROR, 'Data Migration Expression Value in AccountTriggerGenericHelper.genericAfterUpdate() is: ' + dataMigrationExp);
+
+                if (dataMigrationExp){
+                    system.debug('entered dataMigrationExp');
+                    String actionCode;
+                    //TSV-1522 CODE STARTS HERE
+                    List<String> lstFieldToCheckStatus = new List<String>{ 'Suppress_Sync__c' };
+                    Map<String, Boolean> mapFieldStatus = TriggerUtility.isFieldChanged(a, accountOldItem, lstFieldToCheckStatus);
+                    system.debug('a.Re_trigger_date__c****' + a.Re_trigger_date__c);
+                    system.debug('accountOldItem.Re_trigger_date__c' + accountOldItem.Re_trigger_date__c);
+                    system.debug('a.Address_Validated__c' + a.Address_Validated__c);
+                    system.debug('a.AddressConfirmedByIDQ__c' + a.AddressConfirmedByIDQ__c);
+                    system.debug('a.AddressValidationAttempted__c' + a.AddressValidationAttempted__c);
+                    // system.debug('checkRecursive.runOnceAfter()'+checkRecursive.runOnceAfter());
+
+                    //Removed Addressable, added Suppresse sync - GTT-3610
+                    if (accountOldItem.Suppress_Sync__c && !a.Suppress_Sync__c && mapFieldStatus.containsKey('Suppress_Sync__c') && mapFieldStatus.get('Suppress_Sync__c')){
+                        actionCode = 'Create';
+                    }
+                     //TSV-1522 CODE ENDS HERE
+                    else if (a.Siebel_Id__c != null && accountOldItem.Siebel_Id__c == null){
+                        actionCode = 'Create';
+
+                        System.debug(LoggingLevel.ERROR, 'Create Request from AccountTriggerGenericHelper.genericAfterUpdate() when old and new record Siebel Row Id is not null');
+                    } else if (a.Re_trigger_date__c != accountOldItem.Re_trigger_date__c && (a.Address_Validated__c || a.AddressConfirmedByIDQ__c || a.AddressValidationAttempted__c) && checkRecursive.runOnceAfter()){
+                        System.debug(LoggingLevel.INFO, 'checkRecursive.runOnceAfter()' + checkRecursive.runOnceAfter());
+
+                        actionCode = 'Update';
+
+                        System.debug(LoggingLevel.ERROR, 'Update Request from AccountTriggerGenericHelper.genericAfterUpdate() when field is updated');
+                        
+                    } 
+                    if (actionCode != null){
+                        Id sfdcId = a.Id;
+                        system.debug('@======>AccountSystem.isBatch()' + System.isBatch());
+                        system.debug('@======>AccountSystem.isFuture()' + System.isFuture());
+                        if (!System.isBatch() && !System.isFuture()){
+                            AccountCalloutActionHandler.processAccRequest(sfdcId, actionCode, null);
+                        }
+                        System.debug(LoggingLevel.ERROR, 'Final request to Boomi from AccountTriggerGenericHelper.genericAfterUpdate() with Action Code: ' + actionCode);
+                    }
+                    system.debug('actionCode is null' + actionCode);
+                }
+                system.debug('data migration is null');
+            }
+        }
+    }
+
+    /*********************************************************************************************
+     Common method to execute the after insert functionalities
+     ----------------------------------------------------------------------------------------------
+     Functionalities Implemented:
+     1. Inserting Custom_Account_Team with Account_Team_Member records dsata
+     2. If the account record has created then send the mail to the related Contact with the specified details
+     ************************************************************************************************/
+    public static void genericAfterInsert(Map<Id, SObject> newItems){
+        System.debug(LoggingLevel.ERROR, '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@genericAfterInsert');
+
+        //Initialise Variables
+        List<Account> newAccItems = (List<Account>)newItems.values();
+
+        Set<Id> datamigruserId = new Set<Id>();
+
+        //Start SFCF-1274
+        List<PermissionSetAssignment> datamigruser = TriggerUtility.getDataMigrationUser();
+        //List<PermissionSetAssignment> datamigruser=[Select AssigneeId FROM PermissionSetAssignment WHERE PermissionSet.Name = 'Data_Migration_Permission'];
+        //End SFCF-1274
+        for (PermissionSetAssignment vPSA : datamigruser){
+            datamigruserId.add(vPSA.AssigneeId);
+        }
+
+        if (contextUserId != UserInfo.getUserId() || contextUser == null){
+            //Start SFCF-1274
+            contextUser = currentUser;
+            // contextUser=[Select Name,Full_Name__c,Migration_User__c from User where Id=:UserInfo.getUserId()];
+            //End SFCF-1274
+        }
+		
+        List<Account> acntsToUpdateList = new List<Account>(); //added for CRMU-831,CRMU-954,CRMU-1119
+        
+        for (Account a : newAccItems){
+            String contextUsername = UserInfo.getUserName();
+
+            System.debug(LoggingLevel.ERROR, 'User Id of Context User in AccountTriggerGenericHelper.genericAfterInsert is: ' + contextUserId);
+            System.debug(LoggingLevel.ERROR, 'Value of contextUsername in AccountTriggerGenericHelper.genericAfterInsert: ' + contextUsername);
+            System.debug(LoggingLevel.ERROR, 'Value of contextUser in AccountTriggerGenericHelper.genericAfterInsert: ' + contextUser);
+            //TSV-1522 SUppress flag condition added
+            if (!a.Suppress_Sync__c && !contextUsername.contains(Label.NonTriggeringAdmin_Username) && UserInfo.getName() != Label.InactiveAccountContactUser && !contextUsername.contains(Label.SiebelEAI_Username) && !contextUsername.contains(Label.Batch_username) && !contextUsername.contains(Label.SiebelEAI_Username) && !contextUsername.contains(Label.TFIntegration_username) && contextUser.Migration_User__c == false && contextUser.Full_Name__c != Label.Data_Migration_label && !contextUsername.contains('cdm')){
+                System.debug(LoggingLevel.ERROR, 'Entered Username check block in AccountTriggerGenericHelper.genericAfterInsert()');
+
+                boolean dataMigrationExp = datamigruserId.contains((Id) UserInfo.getUserId()) ? false : true;
+
+                System.debug(LoggingLevel.ERROR, 'Data Migration Expression Value in AccountTriggerGenericHelper.genericAfterInsert() is: ' + dataMigrationExp);
+
+                if (dataMigrationExp){
+                    Id sfdcId = a.Id;
+                    String actionCode = 'Create';
+
+                    AccountCalloutActionHandler.processAccRequest(sfdcId, actionCode, null);
+
+                    System.debug(LoggingLevel.ERROR, 'Create Request from AccountTriggerGenericHelper.genericAfterInsert()');
+                }
+            }
+            
+            //===============start added for CRMU-831,CRMU-954,CRMU-1119======
+            Account acnt = (Account)updateAccountRecordRegion(a,null);
+            if(acnt != null)
+            	acntsToUpdateList.add(acnt);
+            system.debug('@@acntsToUpdateList:'+acntsToUpdateList);
+            //===============end added for CRMU-831,CRMU-954,CRMU-1119===
+        }
+        
+		//============Start Move 'Update Account Record Region' flow code in trigger for CRMU-831,CRMU-954,CRMU-1119=====
+        if(acntsToUpdateList !=null && !acntsToUpdateList.isEmpty()) {
+            TriggerUtility.objectNames.add('Account');
+			//AccountTriggerHandler.TriggerDisabled = TRUE;
+            update acntsToUpdateList;
+        }
+        //============End Move 'Update Account Record Region' flow code in trigger for CRMU-831,CRMU-954,CRMU-1119=====
+        
+        List<Messaging.SingleEmailMessage> eMaiList = new List<Messaging.SingleEmailMessage>();
+        Set<Id> setOfAccountIds = new Set<Id>();
+        Boolean recursionFlag = CJRUpdate.runOnce();
+
+        List<Account> lstAccCJRUpdate = new List<Account>();
+        List<Partner_Accounts__c> partneraccounts = new List<Partner_Accounts__c>();
+
+        set<string> Partnervalue = new SET<String>();
+        boolean partnerValues = false;
+        Partnervalue.addAll(Label.partner_role.split(','));
+
+
+        //Iterate the account records
+        for (Account currentAccount : (List<Account>)newItems.values()){
+
+            SET<string> setofpartnervalues = new SET<string>();
+            if (currentAccount.Partner_Role__c != null){
+                setofpartnervalues.AddAll(currentAccount.Partner_Role__c.split(';'));
+                for (String partner : Partnervalue){
+                    if (setofpartnervalues.contains(partner)){
+                        partnerValues = true;
+                    }
+                }
+            }
+            //Added as part of TSV-1241 strats
+            if (currentAccount.Partner_Role__c != null && partnerValues == True){
+                System.debug('test indoe');
+                Partner_Accounts__c partneracount = new Partner_Accounts__c();
+                System.debug('TSV-1241 :  After Insert called inside tets');
+                if (currentAccount.Name.length() > 80)
+                    partneracount.Name = currentAccount.Name.substring(0, 80);
+                else
+                    partneracount.Name = currentAccount.Name;
+                partneracount.AccountId__c = currentAccount.id;
+                partneraccounts.add(partneracount);
+            }
+            //Ends
+            if (recursionFlag){
+                //checks whether the CJR and Siebel Id fields are null
+                if (currentAccount.CJR__c != null && currentAccount.Siebel_Id__c != null){
+                    // Calls the method mailSendingCJRUpdate
+                    lstAccCJRUpdate.add(currentAccount);
+                }
+            }
+            setOfAccountIds.add(currentAccount.Id);
+
+        }
+         //For loop ends here
+        //Added as part f tsv-1241
+        if (!partneraccounts.isEmpty())
+            insert partneraccounts;
+        //Ends
+
+        //Call To Inserting Custom_Account_Team with Account_Team_Member records data
+        if (setOfAccountIds.size() != 0){
+            system.debug('NEW ACCOUNT ' + newAccItems);
+            AccountTriggerHelper.customAccountTeamInsert(setOfAccountIds, usrteamrole); //Added usrteamrolefor GTT-4077
+        }
+        if (lstAccCJRUpdate != null && lstAccCJRUpdate.size() > 0){
+            emailist = AccountTriggerHelper.mailSendingCJRUpdate(lstAccCJRUpdate);
+            // If email List is not empty the mail will send to contact
+            if (eMaiList != null && eMaiList.size() != 0 && !Test.isRunningTest()){
+                Messaging.SendEmailResult[] sendEmails = Messaging.sendEmail(eMaiList);
+            }
+        }
+    }
+
+    //End of genericAfterInsert
+    /***********************************************************************************
+     Purpose     : To check if customer is entitle to Create a account with Service entitlement
+     Return type : void
+     Call from   : genericBeforeInsert
+     ************************************************************************************/
+    public static void checkserviceEntitlementoninsert(Account AccountRecord){
+
+        System.debug('$$$ inside checkserviceEntitlementoninsert...');
+        //current user's group memeber doesnt not belong to Service Entitled Users group  and service Entitlement contains Direct access , throw custom error
+        if (userGroupMemberMap.get('Service_Entitled_Users').IsEmpty() && AccountRecord.Service_Entitlement__c.containsOnly('Direct Access')){
+            AccountRecord.addError(label.Entitlement_Error);
+        }
+    }
+
+     //end of checkserviceEntitlementoninsert
+    /***********************************************************************************
+     Purpose     : To check if customer is entitle to update the account Service entitlement field
+     Return type : void
+     Call from   : genericBeforeUpdate
+     ************************************************************************************/
+    public static void checkserviceEntitlementonupdate(Account CurrentRecord, Account Oldrecord){
+        System.debug('$$$ inside checkserviceEntitlementonupdate...');
+        Boolean wasDirect = FALSE;
+
+        if (Oldrecord.Service_Entitlement__c != null){
+            if (Oldrecord.Service_Entitlement__c == 'Direct Access'){
+                wasDirect = True;
+
+            }
+        }
+        //old Account record Account entitlement contains 'Direct Access' and new value does not contains 'Direct Access' OR
+        //old Account  record Account entitlement does not contains 'Direct Access' and new value contains 'Direct Access',
+        if (CurrentRecord.Service_Entitlement__c != null){
+            if ((wasDirect && !CurrentRecord.Service_Entitlement__c.containsOnly('Direct Access')) || (!wasDirect && CurrentRecord.Service_Entitlement__c.containsOnly('Direct Access'))){
+                if (userGroupMemberMap.get('Service_Entitled_Users').isEmpty() && currentUser.ProfileId != Label.SystemAdmin){
+                    CurrentRecord.addError(label.Entitlement_Error);
+                }
+            }
+        } else{
+            if (wasDirect && userGroupMemberMap.get('Service_Entitled_Users').IsEmpty() && currentUser.ProfileId != Label.SystemAdmin){
+                CurrentRecord.addError(label.Entitlement_Error);
+            }
+        }
+    }
+
+     //end of checkserviceEntitlementonupdate
+    Public static void PropagateTAMAccountContacts(List<ID> tamAccList){
+        if (!tamAccList.isEmpty() && tamAccList.size() > 0){
+            List<Contact> con = [SELECT Id, AccountId, tocSiebelId__c
+                                 FROM Contact
+                                 WHERE tocSiebelId__c = null AND AccountId = :tamAccList[0]
+                                 order by createdDate ASC];
+            if (con.Size() > 0 && !con.isEmpty() && con[0].tocSiebelId__c == null){
+                //added as part of SFCF-231 contact bulkification
+                for (Contact cont : con){
+                    ContactCalloutActionHandler.processConRequest(cont.Id, 'Create');
+                }
+            }
+        }
+    }
+
+    /***************************************************************************
+     SFCF-746- added for (Lead Converted Contact Flow to Siebel) - Devaki Jois
+     ****************************************************************************/
+    Public static void PublishLeadContact(List<ID> LeadAccList){
+
+        List<Contact> ContactLeadList = new List<Contact>();
+        if (!LeadAccList.isEmpty() && LeadAccList.size() > 0){
+            ContactLeadList = [SELECT Id, AccountId, tocSiebelId__c, Lead_Conversion__c, CreatedDate, Account.createdDate
+                               FROM Contact
+                               WHERE Lead_Conversion__c = true and AccountId = :LeadAccList[0]];
+            System.debug('InPublishLead Contact Size' + ContactLeadList);
+            if (ContactLeadList.Size() > 0 && !ContactLeadList.isEmpty()){
+                for (Contact contlist : ContactLeadList){
+                    System.debug('AccCreatedDate' + ContList.account.Createddate);
+                    System.debug('ConCreatedDate' + ContList.CreatedDate);
+                    Datetime Condate = ContList.CreatedDate;
+                    Datetime Accdate = ContList.account.Createddate;
+                    If (contlist.tocSiebelId__c == null && Condate.day() == Accdate.day()){
+                        System.debug('Just before ContactCallOut' + Contlist.Id);
+                        system.debug('@======>AccountSystem.isBatch()' + System.isBatch());
+                        system.debug('@======>AccountSystem.isFuture()' + System.isFuture());
+                        if (!System.isBatch() && !System.isFuture()){
+                            ContactCalloutActionHandler.processConRequest(contlist.Id, 'Create');
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+    * @description If the ecommerce billing accounts aren't SAP integrated, we need to retrigger SAP integrations for these billing accounts
+    * upon the location accounts are SAP interated and they're marked as legal entity checked.
+    * @param newAccounts new map of accounts
+    * @param oldAccounts old map of accounts
+    */
+    private static void retriggerSAPOnEcomSpecificBillingAccounts(Map<Id, SObject> newAccounts, Map<Id, SObject> oldAccounts){
+        // Collect the ecommerce accounts which are SAP published. Note: ecommerce accounts have IsPendingAccount__c = true
+       if(!Test.isRunningTest()){
+        Set<Id> sapPublishedAccountIds = new Set<Id>();
+        for (Account newAccount : (List<Account>)newAccounts.values()){
+            Account oldAccount = (Account)oldAccounts.get(newAccount.Id);
+            
+            // Check only for ecommerce accounts if the account is LE checked and SAP_Published__c is switched to true
+            if(newAccount.IsPendingAccount__c && newAccount.Legal_Entity__c && (!oldAccount.SAP_Published__c && newAccount.SAP_Published__c)){
+                sapPublishedAccountIds.add(newAccount.Id);
+            }
+        }
+
+        // Collect the set of billing accounts needs to re-trigger SAP integration
+        Set<Id> billingAccountIds = new Map<Id, tocSubscriber__c>([SELECT Id FROM tocSubscriber__c WHERE Account__c IN : sapPublishedAccountIds])?.keySet();
+        if(billingAccountIds != null && !billingAccountIds.isEmpty()){
+            System.enqueueJob(new ECOM_SAPQueueable(billingAccountIds));
+        }
+        }   
+    }
+
+     /**
+    * @description Re-triggers SAP integration for the provided set of billing accounts
+    * @param billingAccountIds set of billing account ids for SAP integration
+    */
+    @TestVisible 
+    private static void retriggerSAPIntegration(Set<Id> billingAccountIds){
+        String actionCode = ECOM_trConstantHelper.getTrConstantStringValue('ECOMMERCE_BA_SAP_ACTIONCODE');
+        for(Id billingAccountId : billingAccountIds){
+            // re-trigger SAP integration
+            AccountCalloutActionHandler.processAccRequest(billingAccountId, actionCode, null);
+        }
+    }
+	
+    /***********start updateAccountRecordRegion()*************************************************************
+     *Following code is for moving 'Update Account Record Region' flow code to trigger for CRMU-831,CRMU-954,CRMU-1119
+     *Purpose     : To update Account_Record_Region field on account with region field value on metadata by comparing country code 
+					and country with Account_Region_Map__mdt metadata values
+     *Return type : void (updates the account)
+     *Call from   : genericBeforeInsert,genericBeforeUpdate     
+	*/
+    public static Account updateAccountRecordRegion(Account newAcnt, Account oldAcnt) {
+        Account act;
+    	Map<String,Account_Region_Map__mdt> acntRegiomMdtMap= new Map<String,Account_Region_Map__mdt>();
+        //access metadata values
+        List<Account_Region_Map__mdt> acntRegiomMdtList= Account_Region_Map__mdt.getAll().values();
+        system.debug('@@acntRegiomMdtList:'+acntRegiomMdtList);
+        if(acntRegiomMdtList != null && acntRegiomMdtList.size() > 0) {
+            for(Account_Region_Map__mdt actRgnMdt : acntRegiomMdtList) {
+                if(actRgnMdt.Country_Code__c != null && actRgnMdt.DeveloperName != null) {
+                	acntRegiomMdtMap.put(actRgnMdt.Country_Code__c,actRgnMdt);
+                }
+            }
+            system.debug('@@acntRegiomMdtMap:'+acntRegiomMdtMap);
+        }
+        
+        if(acntRegiomMdtMap != null) {
+            system.debug('@@newAcnt.tfCrmCountry__c:'+newAcnt.tfCrmCountry__c);
+            if((acntRegiomMdtMap.containsKey(newAcnt.tfcmCountryCode__c)) && 
+               (acntRegiomMdtMap.get(newAcnt.tfcmCountryCode__c).Country_Name__c.equals(newAcnt.tfCrmCountry__c))) {
+               system.debug('@@oldAcnt:'+oldAcnt+'==newAcnt.Id:'+newAcnt.Id);    
+               if(oldAcnt == null || (oldAcnt != null && newAcnt.tfcmCountryCode__c != oldAcnt.tfcmCountryCode__c)) {
+                   act = new Account();
+                   act.Account_Record_Region__c = acntRegiomMdtMap.get(newAcnt.tfcmCountryCode__c).Region__c;
+                   act.Id = newAcnt.Id;
+               }
+            }
+        }
+        system.debug('@@act:'+act);
+        
+        return act;
+	}
+	/**********end updateAccountRecordRegion()**************************************************************/
+    
+    /** 
+    * @description Queueable class to processes the ecommerce Billing account SAP interations asynchronously
+    */
+    class ECOM_SAPQueueable implements Queueable, Database.AllowsCallouts {        
+        private Set<Id> billingAccountIds;
+
+        public ECOM_SAPQueueable(Set<Id> billingAccountIds){
+            this.billingAccountIds = billingAccountIds;
+        }
+
+        public void execute(QueueableContext context){
+            retriggerSAPIntegration(billingAccountIds);            
+        }
+    }
+}
