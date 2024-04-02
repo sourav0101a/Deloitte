@@ -1,0 +1,400 @@
+/***************************************************************************************************
+Class Name : Accounthierarchyqueueable  
+Description : This class will GET all child records and updat with parent's ultimate parent,Agreement values 
+updates to DSS from object Ultimate_Parent_Flow__c.FRO-1654
+Test class: AccounthierarchyqueueableTest
+-----------------------------------------------------------------------------------------------------
+Date             Author            Version             Comments
+01/06/2020       Navya Vasa         1.0                 Initial Development
+27/07/2020       Prashant Anjana    2.0                 Logic to Chain jobs, that updates all hierarchy childs, inserts into custom object,fires scheduler that sends the account details out from SFDC. FireAccountPublish, AccountUltimateParentFlow,UltimateFlowRecordDelete  
+*****************************************************************************************************/
+public class Accounthierarchyqueueable implements Queueable, database.allowscallouts{
+    private Map<Id,Id> accountsBeingReparented;
+    private integer step;
+    public Map<Id,Account> ultimateParents = new Map<Id,Account>();
+    public Map<Integer,Map<Id,Account>> descendentsByLevel = new Map<Integer,Map<Id, Account>>();
+    public Map<Integer,Map<Id,Account>> descendentsByLevelfrom6 = new Map<Integer,Map<Id, Account>>();
+    public boolean firstRun = true;
+    public Map<Id,Account> allAccounts = new Map<Id, Account>();              
+    public List<Account> descendentsToUpdate = new List<Account>();
+    public List<Account> descendentsToFlow = new List<Account>();
+    public Map<id,id> triggerChildMap = new  Map<id,id>();
+    public List<Ultimate_Parent_Flow__c> upBoomiFlow = new List<Ultimate_Parent_Flow__c>(); 
+    Public Database.SaveResult [] updateResult;
+    public List<String> insertErrorList = new List<String>();
+    
+    //Custom settings to control the flow count.
+    Ultimate_Parent_Chain_Batch_Size__c upSetting = Ultimate_Parent_Chain_Batch_Size__c.getInstance('Ultimate_Flow_Size');
+    private integer X = Integer.valueof(upSetting.Schedule_Limit_Mins__c);  //This unit is responsible for invoking scheduler after X mins.
+    private integer maxAccUpdatePerChain = Integer.valueof(upSetting.MaxSFDCAccUpdateRec__c);//This unit is responible for number of account updates per batch
+    
+    boolean returnMsg; // this is to control the logic of failed attempts by-passed.
+    integer count = 0;
+    integer AccountFlowcount = 0;
+    integer descendentsToUpdateCnt = 0;
+    Integer AccountsIdCount;
+    
+    public Accounthierarchyqueueable (Map<Id,Id> accountsBeingReparented) {
+        this.accountsBeingReparented = accountsBeingReparented;
+        this.step = 0;
+        count = 0;
+        this.AccountFlowcount = 0;
+        returnMsg = false;
+    }
+    
+    public void execute(QueueableContext qc)
+    {       
+       Try{
+            Hierarchy_Trigger__c settings = Hierarchy_Trigger__c.getOrgDefaults();
+            settings.queueExecuted__c = true;
+            upsert settings Hierarchy_Trigger__c.Id;
+            if(step == 0) {
+                //Added by Navya V for FRO-1654 to bypass Trigger                 
+                //Changed to SOQL to lock the record
+                Map<id,Account> changedByTrigger =new Map<Id,Account>([Select id,Name,Restriction__c,Ultimate_Parent_Account__c,Parent.Ultimate_Parent_Account__c,
+                tfcmCustomerStatus__c,Legal_Entity__c,ParentId,TDO_Status__c,trTDOCheckDate__c,Contract_Type__c,tocAgreementType__c,tocAgreementNo__c,
+                tocAgreementStatus__c,Credit_Check_Status__c,TRSC_Sales_Term__c,trCreditCheckDate__c,trAccountClass__c,TRMA__c,
+                Ultimate_Parent_Account__r.Name,Parent.Name,Parent.Contract_Type__c,Parent.TRSC_Sales_Term__c,Parent.Credit_Check_Status__c, 
+                Parent.trTDOCheckDate__c,Parent.trCreditCheckDate__c,Parent.tocAgreementType__c,Parent.tocAgreementNo__c,Parent.TDO_Status__c,
+                Parent.tocAgreementStatus__c,Parent.TRMA__c,Parent.trAccountClass__c
+                FROM ACCOUNT Where id =: accountsBeingReparented.KeySet()]);
+               
+                descendentsByLevel = findDescendents(changedByTrigger, 1 ,triggerChildMap );
+
+                if(descendentsByLevel.get(5)!=null)
+                {
+                    descendentsByLevelfrom6  = findDescendents(descendentsByLevel.get(5), 6,triggerChildMap);  // retrieve descendent accounts levels 6-10
+                    descendentsByLevel.putAll(descendentsByLevelfrom6);
+                }
+               
+                for(Integer i = 1; i <= descendentsByLevel.size(); i++){
+                    if(descendentsByLevel.get(i) != null) 
+                    {
+                        allAccounts.putAll(descendentsByLevel.get(i));
+                    }
+                 }
+                
+                 List<Account> listQuerytoUpdate = [Select id,Name,Restriction__c,Ultimate_Parent_Account__c,Parent.Ultimate_Parent_Account__c,Segment__c,tfcmCustomerStatus__c,Legal_Entity__c,ParentId,TDO_Status__c,trTDOCheckDate__c,Contract_Type__c,tocAgreementType__c,
+                 tocAgreementNo__c,tocAgreementStatus__c,Credit_Check_Status__c,TRSC_Sales_Term__c,trCreditCheckDate__c,trAccountClass__c,
+                 TRMA__c FROM ACCOUNT Where id =:triggerChildMap.KeySet() and id =: allAccounts.KeySet()];
+                
+                for(Account childUpdates : listQuerytoUpdate)
+                {  
+                    Account parentToRippleValues =  changedByTrigger.get(triggerChildMap.get(childUpdates.id));
+                    /*if(parentToRippleValues.Restriction__c == label.validateECRestriction){
+                        childUpdates.Restriction__c = label.validateECRestriction;
+                    }*/
+                    
+                    if(parentToRippleValues.ParentId != Null){
+                        childUpdates.Ultimate_Parent_Account__c = parentToRippleValues.Ultimate_Parent_Account__c;
+                    }
+                    else{         
+                        childUpdates.Ultimate_Parent_Account__c = parentToRippleValues.Id;
+                    }  
+                    childUpdates.TDO_Status__c= parentToRippleValues.TDO_Status__c;
+                    childUpdates.trTDOCheckDate__c= parentToRippleValues.trTDOCheckDate__c;                               
+                    childUpdates.Credit_Check_Status__c= parentToRippleValues.Credit_Check_Status__c;                              
+                    childUpdates.trCreditCheckDate__c=parentToRippleValues.trTDOCheckDate__c;
+                    childUpdates.trAccountClass__c=parentToRippleValues.trAccountClass__c;
+                    if(parentToRippleValues.tocAgreementType__c ==label.RMA_Form_Name && parentToRippleValues.tocAgreementStatus__c.equalsIgnoreCase('Active')){
+                        if(childUpdates.tocAgreementType__c==NULL){ 
+                            childUpdates.tocAgreementType__c= parentToRippleValues.tocAgreementType__c;
+                            System.debug(LoggingLevel.Info, 'Entered TRMA Condition'+parentToRippleValues.tocAgreementType__c +''+label.RMA_Form_Name);
+                        }
+                        if(childUpdates.tocAgreementNo__c==null)
+                            childUpdates.tocAgreementNo__c =parentToRippleValues.tocAgreementNo__c;
+                        if(childUpdates.tocAgreementStatus__c==null )
+                            childUpdates.tocAgreementStatus__c  =parentToRippleValues.tocAgreementStatus__c;
+                        if(childUpdates.TRSC_Sales_Term__c == null)
+                            childUpdates.TRSC_Sales_Term__c  = parentToRippleValues.TRSC_Sales_Term__c;
+                        if(!childUpdates.TRMA__c)
+                            childUpdates.TRMA__c  =true;
+                    }
+                    if(childUpdates.tfcmCustomerStatus__c=='Credit Hold' || parentToRippleValues.tfcmCustomerStatus__c=='Credit Hold' )
+                    {
+                        childUpdates.tfcmCustomerStatus__c= parentToRippleValues.tfcmCustomerStatus__c;
+                    } 
+                
+                    descendentsToUpdate.add(childUpdates);
+                }
+                if(descendentsToUpdate.size()>0 && step == 0)
+                {
+                    // here we know that there will be records that needs hierarchy updates. Hence move them to next step for update.
+                    step++;
+                    descendentsToUpdateCnt = descendentsToUpdate.size();
+                    //clone the list as we need to use this ahead in the insert module of the custom object.
+                    descendentsToFlow.addall(descendentsToUpdate);
+                }
+                system.debug(LoggingLevel.Info,'I have performed '+Limits.getQueries()+' and I am allowed up to '+Limits.getLimitQueries()+ ' within this request'); 
+                system.debug(LoggingLevel.Info,'I have performed '+Limits.getQueueableJobs()+' and I am allowed up to '+Limits.getLimitQueueableJobs()+ ' within this request'); 
+             }
+             if(step==1){
+                //this block executes the updates of the account in batches of maxAccUpdatePerChain.
+                System.debug(LoggingLevel.Info,'descendentsToUpdateCnt' + descendentsToUpdateCnt+ ':count:'+count);
+                if (count < descendentsToUpdateCnt) {
+                    integer descendentsUpdated = 0;
+                    integer descendentsUpdateddual = 0;
+                    List<Account> batchToUpdate = new List<Account>();                    
+                    
+                    while( (count < descendentsToUpdateCnt) && (descendentsUpdated < maxAccUpdatePerChain) && descendentsToUpdate.size() > 0 ) {
+                        System.debug(LoggingLevel.Info,'_descendentsToUpdateCnt_' + descendentsToUpdateCnt+ '_count_'+count+'_descendentsUpdated_'+descendentsUpdated);
+                        System.debug(loggingLevel.INFO, 'descendentsToUpdate size'+descendentsToUpdate.Size());
+                        if(descendentsToUpdate.size() > descendentsUpdated && descendentsToUpdate[descendentsUpdated] !=null){
+                            System.debug(loggingLevel.INFO, 'batchToUpdate'+batchToUpdate.size());
+                            batchToUpdate.add(descendentsToUpdate[descendentsUpdated]);
+                            System.debug(loggingLevel.INFO, 'descendentsToUpdate[count]'+descendentsToUpdate[descendentsUpdated]);
+                            //descendentsToUpdate.remove(descendentsUpdated);
+                            System.debug(loggingLevel.INFO, 'descendentsToUpdate size'+descendentsToUpdate.Size());
+                        }
+                        count++;
+                        descendentsUpdated++;
+                        System.debug(loggingLevel.INFO, '_count size_'+count+'_descendentsUpdated_'+descendentsUpdated);
+                    }
+                    while( (descendentsUpdateddual < descendentsToUpdateCnt) && (descendentsUpdateddual < maxAccUpdatePerChain) && descendentsToUpdate.size() > 0 ) {
+                        descendentsToUpdate.remove(0);
+                        descendentsUpdateddual++;
+                    }
+                    //update all maxAccUpdatePerChain accounts into DB
+                    returnMsg = updateAccountsInSFDC(batchToUpdate);
+                    // now chain next untill all records are completed.
+                    if(!Test.isRunningTest()) {
+                        ID jobID = System.enqueueJob(this);
+                    }
+                    System.debug(loggingLevel.INFO, 'ANother Run');
+                }
+                else {
+                    System.debug(loggingLevel.INFO, 'All done here, proceed with next steps'+descendentsToUpdateCnt+': count :'+count);
+                    //At this point of time all the updates are done. Ready to fire them for publish in next step.
+                    if(count >= descendentsToUpdateCnt){
+                        //ideally all data now should be updated in SFDC. and we proceed here to push them out from SFDC.
+                        system.debug('reaced the end'+step);
+                    }
+                    //Loop breaker. move to next step if there are no actions left.
+                    step++;
+                    System.debug(loggingLevel.INFO, 'All done here, proceed with next steps:  '+step);
+                }
+            }
+            System.debug(loggingLevel.INFO, 'Final Step before:  '+step);
+            if(!Test.isRunningTest()) {
+            if(step==2){
+                // insert the details out into custom object.
+                for( Account a: descendentsToFlow ){
+                    Ultimate_Parent_Flow__c UpFlow = new Ultimate_Parent_Flow__c();
+                    UpFlow.Name = a.Id;
+                    upBoomiFlow.add(UpFlow);
+                }
+                if(upBoomiFlow.size()>0)
+                {
+                    Insert upBoomiFlow;
+                    
+                    //After inserting, we will setup a schedule to fire after X mins. Hoping all the updates are completed in SFDC.
+                    FireAccountPublish AccountPublishScheduler = new FireAccountPublish();
+                    DateTime now  = DateTime.now();
+                    DateTime nextRunTime = now.addMinutes(X);
+                    System.debug(LoggingLevel.INFO, '#### nextRunTime is ' + nextRunTime);                
+                    String cronString = '' + nextRunTime.second() + ' ' + nextRunTime.minute() + ' ' + 
+                    nextRunTime.hour() + ' ' + nextRunTime.day() + ' ' + 
+                    nextRunTime.month() + ' ? ' + nextRunTime.year();
+                    // format for cronString is seconds minutes hours day_of_month month day_of_week year
+                      
+                    System.debug(LoggingLevel.INFO, '#### calculated cronString is ' + cronString);
+                    String jobID = System.schedule('Fire Account Publish'+nextRunTime, cronString, AccountPublishScheduler);
+                     
+                step++;
+            }
+            System.debug(loggingLevel.INFO, 'Final Step end:  '+step);
+            if(settings.queueExecuted__c){
+                     settings.queueExecuted__c = false;                           
+                     update settings;
+            }
+            }
+                //Added by Navya V for FRO-1654
+                System.debug(LoggingLevel.Info, 'after seting tru 140queue start'+upBoomiFlow);
+            }
+       
+            else{  throw new MyException('Testclass coverage'); }
+            
+            Hierarchy_Trigger__c settingsExit =Hierarchy_Trigger__c.getOrgDefaults();
+            if(settingsExit.queueExecuted__c){
+                settingsExit.queueExecuted__c = false;
+                update settingsExit;
+            }
+            
+         }  Catch(Exception e){
+                System.debug(loggingLevel.INFO, 'An Error occured while Hierarchy rippling job'+e.getStackTraceString()+'_Message_'+e.getMessage());
+                System.debug(LoggingLevel.Info,'_descendentsToUpdateCnt_' + descendentsToUpdateCnt+ '_count_'+count);
+                Hierarchy_Trigger__c settingsEx1 =Hierarchy_Trigger__c.getOrgDefaults();
+                if(settingsEx1.queueExecuted__c){
+                    settingsEx1.queueExecuted__c = false;
+                    update settingsEx1;
+                }
+          }
+          
+       }
+    
+    public boolean updateAccountsInSFDC(List<Account> batchToUpdate){
+        try{            
+                TriggerUtility.objectNames.add('Account');
+                updateResult = Database.update(batchToUpdate, false);               
+                for (Database.SaveResult r : updateResult){
+                    if (!r.isSuccess()){
+                        for(Database.Error err : r.getErrors()) {
+                            insertErrorList.add(err.getStatusCode() + ' : ' + err.getMessage() + ' : ' + err.getFields());
+                        }
+                    }
+                }
+                if(insertErrorList.size()>0)
+                    insertError(insertErrorList);
+                return true;
+        }Catch(Exception ex){
+            insertErrorCatch(ex);
+            Hierarchy_Trigger__c settingsEx2 =Hierarchy_Trigger__c.getOrgDefaults();
+            if(settingsEx2.queueExecuted__c){
+                     settingsEx2.queueExecuted__c = false;                           
+                     update settingsEx2;
+                }
+            return false;
+        }
+    }
+
+    public static void insertError(List<String> Ex)
+    {
+        List<Genesis_System_Error_Handler__c> oErrorHandlerList = new List<Genesis_System_Error_Handler__c>();  
+        Genesis_System_Error_Handler__c oErrorHandler = new Genesis_System_Error_Handler__c();
+        for (String x : Ex){
+            oErrorHandler.name = 'Accounthierarchyqueueable';
+            oErrorHandler.Error_Description__c = x;
+            oErrorHandlerList.add(oErrorHandler);
+        }
+        INSERT oErrorHandlerList;
+    }
+    
+    public static void insertErrorCatch(Exception Ex)
+    {
+        Genesis_System_Error_Handler__c oErrorHandler = new Genesis_System_Error_Handler__c();  
+        oErrorHandler.name = 'Accounthierarchyqueueable';
+        oErrorHandler.Error_Description__c = ex.getMessage()+ex.getLineNumber()+'_'+string.valueof(ex);
+        INSERT oErrorHandler;
+    }
+       
+    
+    public static Map<Integer,Map<Id,Account>> findDescendents(Map<Id,Account> scope, Integer startLevel,Map<id,id> triggerChildMap){
+         system.debug(LoggingLevel.Info,'I have performed '+Limits.getQueueableJobs()+' and I am allowed up to '+Limits.getLimitQueueableJobs()+ ' within this request');                       
+        Map<Integer,Map<Id,Account>> descendentsByLevel = new Map<Integer,Map<Id, Account>>();
+        Map<Id,Account> resultMap = new Map<Id,Account>([SELECT id,Name,Ultimate_Parent_Account__c,Parent.Ultimate_Parent_Account__c,Segment__c,tfcmCustomerStatus__c,Legal_Entity__c, 
+        TDO_Status__c,trTDOCheckDate__c,Contract_Type__c,tocAgreementType__c,tocAgreementNo__c,tocAgreementStatus__c,Credit_Check_Status__c,
+        TRSC_Sales_Term__c,trCreditCheckDate__c,trAccountClass__c,TRMA__c,
+                               ParentId,
+                               Parent.ParentId,
+                               Parent.Parent.ParentId
+                        FROM   Account
+                        WHERE ((ParentId=:scope.keySet()) OR
+                              (Parent.ParentId=:scope.keySet()) OR
+                              (Parent.Parent.ParentId=:scope.keySet()) OR
+                              (Parent.Parent.Parent.ParentId=:scope.keySet()) OR
+                              (Parent.Parent.Parent.Parent.ParentId=:scope.keySet())) FOR UPDATE]);
+                              
+        Map<Id,Account> resultMapto5levels = new Map<Id,Account>([SELECT id,Name,Ultimate_Parent_Account__c,Parent.Ultimate_Parent_Account__c,Segment__c,tfcmCustomerStatus__c,Legal_Entity__c, 
+        TDO_Status__c,trTDOCheckDate__c,Contract_Type__c,tocAgreementType__c,tocAgreementNo__c,tocAgreementStatus__c,Credit_Check_Status__c,
+        TRSC_Sales_Term__c,trCreditCheckDate__c,trAccountClass__c,TRMA__c,
+                               Parent.Parent.Parent.ParentId,
+                               Parent.Parent.Parent.Parent.ParentId
+                        FROM   Account
+                        WHERE ((ParentId=:scope.keySet()) OR
+                              (Parent.ParentId=:scope.keySet()) OR
+                              (Parent.Parent.ParentId=:scope.keySet()) OR
+                              (Parent.Parent.Parent.ParentId=:scope.keySet()) OR
+                              (Parent.Parent.Parent.Parent.ParentId=:scope.keySet())) FOR UPDATE]);
+        //System.debug(Logginglevel.Info,'result map 1-to 5'+resultMap);
+       if(resultMapto5levels.size()>0){
+        for(Account acclevel : resultMapto5levels.values()){
+            resultMap.put(acclevel.id,resultMapto5levels.get(acclevel.id));
+        }
+       }
+        
+        if(resultMap.size()>0 &&descendentsByLevel.get(5)==null){
+        for(Account a : resultMap.values()){
+            if (a.ParentId != null)
+                if(startlevel ==1)
+                triggerChildMap.put(a.id,a.parentid);
+                else
+                triggerChildMap.put(a.id,triggerChildMap.get(a.parentid));
+                
+                 //System.debug(Logginglevel.Info,'startlevel'+startlevel);
+                 //System.debug(Logginglevel.Info,'triggerChildMap'+triggerChildMap);
+            //Ultimate Parent condition
+            if(a.ParentId != null && scope.containsKey(a.ParentId)){
+            if(startlevel ==1)
+                triggerChildMap.put(a.id,a.parentid);
+                else
+                triggerChildMap.put(a.id,triggerChildMap.get(a.parentid));
+               
+                if(descendentsByLevel.containsKey(startLevel)){
+                    descendentsByLevel.get(startlevel).put(a.id, a);
+                    //System.debug(Logginglevel.Info,'startlevel'+startlevel);
+                    }
+                else
+                    descendentsByLevel.put(startlevel, new Map<Id, Account>{a.Id => a});
+            }else if (a.Parent.ParentId != null && scope.containsKey(a.Parent.ParentId)){
+            if(startlevel ==1)
+                 triggerChildMap.put(a.id,a.Parent.parentid);
+                else
+                triggerChildMap.put(a.id,triggerChildMap.get(a.Parent.parentid));
+
+                //System.debug(Logginglevel.Info,'triggerChildMap-t'+triggerChildMap);
+                if(descendentsByLevel.containsKey(startLevel+1)){
+                    descendentsByLevel.get(startlevel+1).put(a.id, a);
+                    }
+                else
+                    descendentsByLevel.put(startlevel+1, new Map<Id, Account>{a.Id => a});
+            }else if (a.Parent.Parent.ParentId != null && scope.containsKey(a.Parent.Parent.ParentId)){
+                if(startlevel ==1)
+                  triggerChildMap.put(a.id,a.Parent.Parent.parentid);
+                else
+                triggerChildMap.put(a.id,triggerChildMap.get(a.Parent.Parent.parentid));
+            
+                if(descendentsByLevel.containsKey(startLevel+2)){
+                    descendentsByLevel.get(startlevel+2).put(a.id, a);
+                    //System.debug(Logginglevel.Info,'startlevel-t'+startlevel);
+                    }
+                else
+                    descendentsByLevel.put(startlevel+2, new Map<Id, Account>{a.Id => a});
+            }else if (a.Parent.Parent.Parent.ParentId != null && scope.containsKey(a.Parent.Parent.Parent.ParentId)){
+                if(startlevel ==1)
+                  triggerChildMap.put(a.id,a.Parent.Parent.Parent.parentid);
+                else
+                triggerChildMap.put(a.id,triggerChildMap.get(a.Parent.Parent.Parent.parentid));
+                 
+                //System.debug(Logginglevel.Info,'startlevel-t'+startlevel);
+                
+                if(descendentsByLevel.containsKey(startLevel+3))
+                    descendentsByLevel.get(startlevel+3).put(a.id, a);
+                else
+                    descendentsByLevel.put(startlevel+3, new Map<Id, Account>{a.Id => a});
+            }else if (a.Parent.Parent.Parent.Parent.ParentId != null && scope.containsKey(a.Parent.Parent.Parent.Parent.ParentId)){
+                if(startlevel ==1)
+                  triggerChildMap.put(a.id,a.Parent.Parent.Parent.Parent.ParentId);
+                else
+                triggerChildMap.put(a.id,triggerChildMap.get(a.Parent.Parent.Parent.Parent.ParentId));
+                 //triggerChildMap.put(a.id,a.Parent.Parent.Parent.Parent.parentid);
+                 //System.debug(Logginglevel.Info,'startlevel-t'+startlevel);
+               
+                
+                if(descendentsByLevel.containsKey(startLevel+4)){
+                    descendentsByLevel.get(startlevel+4).put(a.id, a);
+                    System.debug(Logginglevel.Info,'descendentsByLevel5'+descendentsByLevel);}
+                else{
+                    descendentsByLevel.put(startlevel+4, new Map<Id, Account>{a.Id => a});
+                    System.debug(Logginglevel.Info,'startlevel-t'+startlevel);
+                    System.debug(Logginglevel.Info,'descendentsByLevel5else'+descendentsByLevel.get(5));
+                    }
+               }
+            }
+        }
+        return descendentsByLevel;
+    }
+     
+
+ public class MyException extends Exception {}
+
+}

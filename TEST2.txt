@@ -1,0 +1,105 @@
+/***************************************************************************************************
+   Project: Code Optimisation
+   Class Name : AccountTriggerHandler
+   Description : This class will handle the different events for the Account Trigger
+   -----------------------------------------------------------------------------------------------------
+   Date             Author            Version            Comments
+   2/12/2016        Deepika M         1.0                Initial Development
+   6/15/2020        Pranav Sudhakar   2.0                Optimization for SOQL 101 error
+ *****************************************************************************************************/
+
+public class AccountTriggerHandler implements ITriggerHandler
+{
+    // Allows unit tests (or other code) to disable this trigger for the transaction
+    static Boolean TriggerDisabled = false;
+    public static Set<Id> compareId=new Set<Id>();
+
+    //Checks to see if the trigger has been disabled either by custom setting or by running code
+    public Boolean IsDisabled()
+    {
+       
+
+        Set<String> objectNames = TriggerUtility.TriggerDisabledObjects();
+
+        if(objectNames.contains('ALL') || objectNames.contains('Account'))
+        {
+            TriggerDisabled = true;
+        }
+
+        else
+        {
+            if(Trigger.isUpdate)
+            {
+                if(Trigger.isAfter)
+                {
+                    TriggerDisabled = !TriggerUtility.ExecuteTriggerEvent('AccountAfterUpdate');
+                }
+                else
+                {
+                    TriggerDisabled = !TriggerUtility.ExecuteTriggerEvent('AccountBeforeUpdate');
+                }
+            }
+            else
+            {
+                TriggerDisabled = false;
+            }
+        }
+
+        return TriggerDisabled;
+    }
+
+    //This method will handle the before insert event for the account trigger
+    public void BeforeInsert(List<SObject> newItems)
+    {
+        AccountTriggerGenericHelper.genericBeforeInsert(newItems);
+    }
+
+    //This method will handle the before update event for the account trigger
+    public void BeforeUpdate(Map<Id, SObject> newItems, Map<Id, SObject> oldItems)
+    {
+        
+  
+            //Call methods for before update
+
+            AccountTriggerGenericHelper.genericBeforeUpdate(newItems,oldItems);
+            TriggerUtility.triggerRecursiveCheck.put('AccountBeforeUpdate',false);
+     
+    }
+
+    //This method will handle the before delete event for the account trigger
+    public void BeforeDelete(Map<Id, SObject> oldItems)
+    {
+
+    }
+
+    //This method will handle the after insert event for the account trigger
+    public void AfterInsert(Map<Id, SObject> newItems)
+    {
+    
+            AccountTriggerGenericHelper.genericAfterInsert(newItems);
+        
+    }
+
+    //This method will handle the after update event for the account trigger
+    public void AfterUpdate(Map<Id, SObject> newItems, Map<Id, SObject> oldItems)
+    {
+ 
+            //Call methods for after update events
+
+            AccountTriggerGenericHelper.genericAfterUpdate(newItems,oldItems);
+            TriggerUtility.triggerRecursiveCheck.put('AccountAfterUpdate',false);
+        
+    }
+
+    //This method will handle the after delete event for the account trigger
+    public void AfterDelete(Map<Id,SObject> oldItems)
+    {
+
+    }
+
+    //This method will handle the after undelete event for the account trigger
+    public void AfterUndelete(Map<Id, SObject> oldItems)
+    {
+
+    }
+}
